@@ -33,6 +33,7 @@ class ConvNormLayer(nn.Module):
 
 
 class RepVggBlock(nn.Module):
+    # Call convert_to_deploy when training finished.
     def __init__(self, ch_in, ch_out, act='relu'):
         super().__init__()
         self.ch_in = ch_in
@@ -43,8 +44,10 @@ class RepVggBlock(nn.Module):
 
     def forward(self, x):
         if hasattr(self, 'conv'):
+            # Deployment branch
             y = self.conv(x)
         else:
+            # Training and validation branch
             y = self.conv1(x) + self.conv2(x)
 
         return self.act(y)
@@ -106,6 +109,7 @@ class CSPRepLayer(nn.Module):
             self.conv3 = nn.Identity()
 
     def forward(self, x):
+        # 2 branches: 1*1 CONV + n*RepVgg (x_1) and 1*1 CONV and 1*1 CONV (x_2)
         x_1 = self.conv1(x)
         x_1 = self.bottlenecks(x_1)
         x_2 = self.conv2(x)
@@ -139,7 +143,8 @@ class TransformerEncoderLayer(nn.Module):
     @staticmethod
     def with_pos_embed(tensor, pos_embed):
         return tensor if pos_embed is None else tensor + pos_embed
-
+    
+    # Typical Transformer; no deformable
     def forward(self, src, src_mask=None, pos_embed=None) -> torch.Tensor:
         residual = src
         if self.normalize_before:
@@ -281,15 +286,18 @@ class HybridEncoder(nn.Module):
         return torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
 
     def forward(self, feats):
-        assert len(feats) == len(self.in_channels)
+        assert len(feats) == len(self.in_channels) # 3
+        # Input projectors: 1*1 CONVs projecting to 256 embedding dimensions
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
         
         # encoder
         if self.num_encoder_layers > 0:
+            # self.use_encoder_idx = [2]: Only use the last stage for encoder
             for i, enc_ind in enumerate(self.use_encoder_idx):
-                h, w = proj_feats[enc_ind].shape[2:]
+                h, w = proj_feats[enc_ind].shape[2:] # (h, w) = (21, 21)
                 # flatten [B, C, H, W] to [B, HxW, C]
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
+                # Spatial size or sequence length may be different across batches.
                 if self.training or self.eval_spatial_size is None:
                     pos_embed = self.build_2d_sincos_position_embedding(
                         w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
@@ -297,25 +305,33 @@ class HybridEncoder(nn.Module):
                     pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
 
                 memory = self.encoder[i](src_flatten, pos_embed=pos_embed)
+                # memory.shape: (B, H*W, C); same as input
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
-                # print([x.is_contiguous() for x in proj_feats ])
+                # proj_feats[2].shape: (B, C, H, W)
 
         # broadcasting and fusion
-        inner_outs = [proj_feats[-1]]
-        for idx in range(len(self.in_channels) - 1, 0, -1):
-            feat_high = inner_outs[0]
-            feat_low = proj_feats[idx - 1]
-            feat_high = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_high)
-            inner_outs[0] = feat_high
-            upsample_feat = F.interpolate(feat_high, scale_factor=2., mode='nearest')
+        # Image shapes: (84, 84), (42, 42), (21, 21)
+        # Upsampling
+        inner_outs = [proj_feats[-1]] # [F5] (21, 21)
+        for idx in range(len(self.in_channels) - 1, 0, -1): # 3 channels -> 2 fusions
+            feat_high = inner_outs[0] # (21, 21)
+            feat_low = proj_feats[idx - 1] # (42, 42)
+            feat_high = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_high) # 1*1 CONV to (21, 21)
+            inner_outs[0] = feat_high # Putting back
+            upsample_feat = F.interpolate(feat_high, scale_factor=2., mode='nearest') # Upsampling to (42, 42)
+            # Fusion block
+            # fpn_blocks[i] is applied to the concatenated feats. Concat on embedding dimension: i.e, 256 (C) -> 512
+            # The result is same channel size as input: (B, C, 42, 42)
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
-
-        outs = [inner_outs[0]]
+        # inner_outs: [Fusion_1, Fusion_0, F5]
+        # Downsampling
+        outs = [inner_outs[0]] # [Fusion_1]
         for idx in range(len(self.in_channels) - 1):
             feat_low = outs[-1]
-            feat_high = inner_outs[idx + 1]
-            downsample_feat = self.downsample_convs[idx](feat_low)
+            feat_high = inner_outs[idx + 1] # [Fusion_0]
+            downsample_feat = self.downsample_convs[idx](feat_low) # Downsampling using 3*3 CONV with stride 2
+            # pan_blocks are the same as fpn_blocks 
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_high], dim=1))
             outs.append(out)
 
