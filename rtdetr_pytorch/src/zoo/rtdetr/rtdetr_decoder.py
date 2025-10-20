@@ -400,6 +400,7 @@ class RTDETRTransformer(nn.Module):
 
         in_channels = feat_channels[-1]
 
+        # No looping by default
         for _ in range(self.num_levels - len(feat_channels)):
             self.input_proj.append(
                 nn.Sequential(OrderedDict([
@@ -411,7 +412,9 @@ class RTDETRTransformer(nn.Module):
 
     def _get_encoder_input(self, feats):
         # get projection features
+        # 1*1 CONV to each of the feats
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        # This branch does not execute by default
         if self.num_levels > len(proj_feats):
             len_srcs = len(proj_feats)
             for i in range(len_srcs, self.num_levels):
@@ -518,9 +521,11 @@ class RTDETRTransformer(nn.Module):
     def forward(self, feats, targets=None):
 
         # input projection and embedding
+        # len(feats): 3; output of the encoder
         (memory, spatial_shapes, level_start_index) = self._get_encoder_input(feats)
+        # memory.shape: (B, 9261, 256) where 9261 = 21*21 + 41*41 + 84*84
         
-        # prepare denoising training
+        # prepare denoising training (denoising queries)
         if self.training and self.num_denoising > 0:
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = \
                 get_contrastive_denoising_training_group(targets, \
