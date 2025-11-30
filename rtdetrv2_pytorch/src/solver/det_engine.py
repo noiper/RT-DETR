@@ -36,8 +36,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        samples = samples.to(device)
+        samples = samples.to(device) # samples.shape: [B, 3, 640, 640]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        # An example of targets:
+        ##################################################################################################
+        # {'boxes': tensor([[0.5000, 0.3775, 1.0000, 0.7550], [0.6739, 0.8319, 0.6522, 0.3362]], device='cuda:0'), 
+        #  'labels': tensor([58, 75], device='cuda:0'), 
+        #  'image_id': tensor([248016], device='cuda:0'), 
+        #  'area': tensor([99626.2578, 42533.0625], device='cuda:0'), 
+        #  'iscrowd': tensor([0, 0], device='cuda:0'), 
+        #  'orig_size': tensor([427, 640], device='cuda:0'), 
+        #  'idx': tensor([50299], device='cuda:0')}
+        ##################################################################################################
+        # orig_size: original size of the image; 
+
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step)
 

@@ -144,13 +144,17 @@ class TransformerEncoderLayer(nn.Module):
         residual = src
         if self.normalize_before:
             src = self.norm1(src)
+        # MHA
+        # Only q and k add position embedding.
         q = k = self.with_pos_embed(src, pos_embed)
+        # Linear projection is happening inside Attention module.
+        # Attention module returns attn_output and attn_output_weights
         src, _ = self.self_attn(q, k, value=src, attn_mask=src_mask)
 
         src = residual + self.dropout1(src)
         if not self.normalize_before:
             src = self.norm1(src)
-
+        # FFN
         residual = src
         if self.normalize_before:
             src = self.norm2(src)
@@ -240,8 +244,8 @@ class HybridEncoder(nn.Module):
         ])
 
         # top-down fpn
-        self.lateral_convs = nn.ModuleList()
-        self.fpn_blocks = nn.ModuleList()
+        self.lateral_convs = nn.ModuleList() # yellow box (2 in total)
+        self.fpn_blocks = nn.ModuleList() # Fusion block (2 in total)
         for _ in range(len(in_channels) - 1, 0, -1):
             self.lateral_convs.append(ConvNormLayer(hidden_dim, hidden_dim, 1, 1, act=act))
             self.fpn_blocks.append(
@@ -249,8 +253,8 @@ class HybridEncoder(nn.Module):
             )
 
         # bottom-up pan
-        self.downsample_convs = nn.ModuleList()
-        self.pan_blocks = nn.ModuleList()
+        self.downsample_convs = nn.ModuleList() # blue box (2 in total)
+        self.pan_blocks = nn.ModuleList() # Fusion block (2 in total); same as fpn_blocks
         for _ in range(len(in_channels) - 1):
             self.downsample_convs.append(
                 ConvNormLayer(hidden_dim, hidden_dim, 3, 2, act=act)
@@ -295,6 +299,7 @@ class HybridEncoder(nn.Module):
         
         # encoder
         if self.num_encoder_layers > 0:
+            # self.use_encoder_idx = [2]: only pass the last layer from the backbone to encoder
             for i, enc_ind in enumerate(self.use_encoder_idx):
                 h, w = proj_feats[enc_ind].shape[2:]
                 # flatten [B, C, H, W] to [B, HxW, C]
@@ -307,9 +312,11 @@ class HybridEncoder(nn.Module):
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
-
-        # broadcasting and fusion
+        # Now proj_feats[2] is the encoder output; proj_feats[:2] are still backbone outputs.
+        
+        # broadcasting and fusion (CCFF)
         inner_outs = [proj_feats[-1]]
+        # idx: 2->1
         for idx in range(len(self.in_channels) - 1, 0, -1):
             feat_heigh = inner_outs[0]
             feat_low = proj_feats[idx - 1]
@@ -318,13 +325,22 @@ class HybridEncoder(nn.Module):
             upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
+        # Eventually, inner_outs stores the output of results after 2 lateral_convs and the final fusion in bottom-up path
+        # inner_outs[0].shape: [B, 256, 80, 80]
+        # inner_outs[1].shape: [B, 256, 40, 40]
+        # inner_outs[2].shape: [B, 256, 20, 20]
 
         outs = [inner_outs[0]]
+        # idx: 0->1
         for idx in range(len(self.in_channels) - 1):
             feat_low = outs[-1]
             feat_height = inner_outs[idx + 1]
             downsample_feat = self.downsample_convs[idx](feat_low)
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
             outs.append(out)
+        # Eventually, outs stores the output of results after fusion blocks in top-down path
+        # outs[0].shape: [B, 256, 80, 80]
+        # outs[1].shape: [B, 256, 40, 40]
+        # outs[2].shape: [B, 256, 20, 20]
 
         return outs

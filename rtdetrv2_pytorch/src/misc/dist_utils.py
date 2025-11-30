@@ -24,7 +24,7 @@ from torch.utils.data import DistributedSampler
 # from torch.utils.data.dataloader import DataLoader
 from ..data import DataLoader 
 
-
+# torchrun for multiple GPU DDP; python for single node training
 def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=None, ):
     """
     env setup

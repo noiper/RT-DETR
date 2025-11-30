@@ -123,26 +123,33 @@ class MSDeformableAttention(nn.Module):
         Returns:
             output (Tensor): [bs, Length_{query}, C]
         """
+        # query: output from self-attention block
+        # value: encoder output
         bs, Len_q = query.shape[:2]
         Len_v = value.shape[1]
 
         value = self.value_proj(value)
         if value_mask is not None:
-            value = value * value_mask.to(value.dtype).unsqueeze(-1)
+            value = value * value_mask.to(value.dtype).unsqueeze(-1) # masked values are set to 0.
 
         value = value.reshape(bs, Len_v, self.num_heads, self.head_dim)
 
-        sampling_offsets: torch.Tensor = self.sampling_offsets(query)
+        # In Deformable DETR, there is no K matrix and no Q @ K comparison. 
+        # The query is fed into two separate nn.Linear layers to directly predict two things:
+        # self.sampling_offsets: "Where should I look in the value memory?"
+        # self.attention_weights: "How much should I care about the points I am about to look at?"
+        sampling_offsets: torch.Tensor = self.sampling_offsets(query) # total of 192 sampling offsets [B, 470, 192]
+        # Here 192 = 8 heads * (4 + 4 + 4) points * 2 (x and y)
         sampling_offsets = sampling_offsets.reshape(bs, Len_q, self.num_heads, sum(self.num_points_list), 2)
-
+        # Query is mapped to a dimension of 96 (num_points)
         attention_weights = self.attention_weights(query).reshape(bs, Len_q, self.num_heads, sum(self.num_points_list))
         attention_weights = F.softmax(attention_weights, dim=-1).reshape(bs, Len_q, self.num_heads, sum(self.num_points_list))
 
-        if reference_points.shape[-1] == 2:
+        if reference_points.shape[-1] == 2: # not used; original deformable detr
             offset_normalizer = torch.tensor(value_spatial_shapes)
             offset_normalizer = offset_normalizer.flip([1]).reshape(1, 1, 1, self.num_levels, 1, 2)
             sampling_locations = reference_points.reshape(bs, Len_q, 1, self.num_levels, 1, 2) + sampling_offsets / offset_normalizer
-        elif reference_points.shape[-1] == 4:
+        elif reference_points.shape[-1] == 4: # used in RT-DETR
             # reference_points [8, 480, None, 1,  4]
             # sampling_offsets [8, 480, 8,    12, 2]
             num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
@@ -210,6 +217,7 @@ class TransformerDecoderLayer(nn.Module):
                 attn_mask=None,
                 memory_mask=None,
                 query_pos_embed=None):
+        # target: queries; reference_points: bboxes; memory: encoder output
         # self attention
         q = k = self.with_pos_embed(target, query_pos_embed)
 
@@ -257,17 +265,21 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         ref_points_detach = F.sigmoid(ref_points_unact)
 
+        # Prevent gradients flow between layers through reference points
+        # i.e, out4 = head4(feat4), out5=head5(feat5), feat5=layer5(feat4)
+        # Layer 5 loss will not backprop to out4.
+        # Box prediction only.
         output = target
         for i, layer in enumerate(self.layers):
             ref_points_input = ref_points_detach.unsqueeze(2)
-            query_pos_embed = query_pos_head(ref_points_detach)
+            query_pos_embed = query_pos_head(ref_points_detach) # dim 4->256; use bbox to decide query pos embeding
 
             output = layer(output, ref_points_input, memory, memory_spatial_shapes, attn_mask, memory_mask, query_pos_embed)
 
-            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
+            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach)) # add anchors
 
             if self.training:
-                dec_out_logits.append(score_head[i](output))
+                dec_out_logits.append(score_head[i](output)) # class logits
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
@@ -431,6 +443,7 @@ class RTDETRTransformerv2(nn.Module):
     def _get_encoder_input(self, feats: List[torch.Tensor]):
         # get projection features
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        # Typically, self.num_levels = len(proj_feats) -> n * (1*1 CONV)
         if self.num_levels > len(proj_feats):
             len_srcs = len(proj_feats)
             for i in range(len_srcs, self.num_levels):
@@ -466,16 +479,16 @@ class RTDETRTransformerv2(nn.Module):
         anchors = []
         for lvl, (h, w) in enumerate(spatial_shapes):
             grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-            grid_xy = torch.stack([grid_x, grid_y], dim=-1)
-            grid_xy = (grid_xy.unsqueeze(0) + 0.5) / torch.tensor([w, h], dtype=dtype)
-            wh = torch.ones_like(grid_xy) * grid_size * (2.0 ** lvl)
-            lvl_anchors = torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4)
+            grid_xy = torch.stack([grid_x, grid_y], dim=-1) # grid_xy[i][j] = [j, i]
+            grid_xy = (grid_xy.unsqueeze(0) + 0.5) / torch.tensor([w, h], dtype=dtype) # Each value is added 0.5 and divided by w or h
+            wh = torch.ones_like(grid_xy) * grid_size * (2.0 ** lvl) # value of 0.05 * 2 ^ lvl on all entries.
+            lvl_anchors = torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4) # shape: [1, h*w, 4]
             anchors.append(lvl_anchors)
-
-        anchors = torch.concat(anchors, dim=1).to(device)
-        valid_mask = ((anchors > self.eps) * (anchors < 1 - self.eps)).all(-1, keepdim=True)
-        anchors = torch.log(anchors / (1 - anchors))
-        anchors = torch.where(valid_mask, anchors, torch.inf)
+        # anchors are x, y, w, h format, normalized to [0, 1]
+        anchors = torch.concat(anchors, dim=1).to(device) # [1, 8400, 4]
+        valid_mask = ((anchors > self.eps) * (anchors < 1 - self.eps)).all(-1, keepdim=True) # [1, 8400, 1]; anchors should not be too close to border. (all 4 values should be within (eps, 1-eps))
+        anchors = torch.log(anchors / (1 - anchors)) # inverse sigmoid
+        anchors = torch.where(valid_mask, anchors, torch.inf) # set invalid anchors to inf
 
         return anchors, valid_mask
 
@@ -495,16 +508,18 @@ class RTDETRTransformerv2(nn.Module):
 
         # memory = torch.where(valid_mask, memory, 0)
         # TODO fix type error for onnx export 
-        memory = valid_mask.to(memory.dtype) * memory  
+        memory = valid_mask.to(memory.dtype) * memory # zero out invalid memory locations 
 
-        output_memory :torch.Tensor = self.enc_output(memory)
-        enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
-        enc_outputs_coord_unact :torch.Tensor = self.enc_bbox_head(output_memory) + anchors
-
+        output_memory :torch.Tensor = self.enc_output(memory) # small refinement block (nn.Linear + nn.LayerNorm)
+        enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory) # [B, L, num_classes]; map to dim 80
+        enc_outputs_coord_unact :torch.Tensor = self.enc_bbox_head(output_memory) + anchors # [B, L, 4]
+        # Use memory to predict boxes and class scores for all locations.
         enc_topk_bboxes_list, enc_topk_logits_list = [], []
         enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact = \
             self._select_topk(output_memory, enc_outputs_logits, enc_outputs_coord_unact, self.num_queries)
-            
+        # enc_topk_memory: [B, 300, 256]
+        # enc_topk_logits: [B, 300, 80]
+        # enc_topk_bbox_unact: [B, 300, 4]
         if self.training:
             enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
             enc_topk_bboxes_list.append(enc_topk_bboxes)
@@ -516,19 +531,19 @@ class RTDETRTransformerv2(nn.Module):
         if self.learn_query_content:
             content = self.tgt_embed.weight.unsqueeze(0).tile([memory.shape[0], 1, 1])
         else:
-            content = enc_topk_memory.detach()
+            content = enc_topk_memory.detach() # no gradient
             
-        enc_topk_bbox_unact = enc_topk_bbox_unact.detach()
+        enc_topk_bbox_unact = enc_topk_bbox_unact.detach() # no gradient
         
         if denoising_bbox_unact is not None:
-            enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
+            enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1) # 300 + # denoising box
             content = torch.concat([denoising_logits, content], dim=1)
         
         return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
 
     def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_coords_unact: torch.Tensor, topk: int):
         if self.query_select_method == 'default':
-            _, topk_ind = torch.topk(outputs_logits.max(-1).values, topk, dim=-1)
+            _, topk_ind = torch.topk(outputs_logits.max(-1).values, topk, dim=-1) # pick the topk predictions with highest class (confidence) scores
 
         elif self.query_select_method == 'one2many':
             _, topk_ind = torch.topk(outputs_logits.flatten(1), topk, dim=-1)
@@ -540,13 +555,13 @@ class RTDETRTransformerv2(nn.Module):
         topk_ind: torch.Tensor
 
         topk_coords = outputs_coords_unact.gather(dim=1, \
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_coords_unact.shape[-1]))
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_coords_unact.shape[-1])) # gather bbox based on topk_ind
         
         topk_logits = outputs_logits.gather(dim=1, \
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_logits.shape[-1]))
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_logits.shape[-1])) # gather logits based on topk_ind
         
         topk_memory = memory.gather(dim=1, \
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1]))
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1])) # gather memory based on topk_ind
 
         return topk_memory, topk_logits, topk_coords
 
@@ -555,7 +570,7 @@ class RTDETRTransformerv2(nn.Module):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
         
-        # prepare denoising training
+        # prepare denoising training (use ground truth box)
         if self.training and self.num_denoising > 0:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
                 get_contrastive_denoising_training_group(targets, \
@@ -567,6 +582,9 @@ class RTDETRTransformerv2(nn.Module):
                     box_noise_scale=self.box_noise_scale, )
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
+        # denoising_logits: noised input_query_class going after embedding layer; [B, 170, 256]
+        # denoising_bbox_unact: unactivated bbox; [B, 170, 4]
+        # attn_mask: attention mask; [#obj_queries + #denosing_queries, #obj_queries + #denosing_queries]
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
@@ -581,14 +599,15 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_score_head,
             self.query_pos_head,
             attn_mask=attn_mask)
-
+        # Split dn outputs and normal outputs
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
-
+        # Only keep the last layer outputs from normal decoder outputs
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
 
         if self.training and self.aux_loss:
+            # aux output: non-last layer outputs; encoder topk outputs; dn outputs
             out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
