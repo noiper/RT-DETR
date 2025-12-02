@@ -1,6 +1,12 @@
 """
 RT-DETRv2 Inference Time Profiling Script
 Measures inference time of each section (backbone, encoder, decoder) of RT-DETRv2
+Usage:
+python profile.py --config rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml --checkpoint rtdetrv2_r18vd_120e_coco.pth
+python profile.py --config rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r34vd_120e_coco.yml --checkpoint rtdetrv2_r34vd_120e_coco.pth
+python profile.py --config rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r50vd_m_7x_coco.yml --checkpoint rtdetrv2_r50vd_m_7x_coco.pth
+python profile.py --config rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r50vd_6x_coco.yml --checkpoint rtdetrv2_r50vd_6x_coco.pth
+python profile.py --config rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r101vd_6x_coco.yml --checkpoint rtdetrv2_r101vd_6x_coco.pth
 """
 
 import torch
