@@ -8,7 +8,7 @@
       "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
       "args": [
         "-c",
-        "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r50vd_6x_coco.yml"
+        "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml"
       ],
       "console": "integratedTerminal",
       "justMyCode": true

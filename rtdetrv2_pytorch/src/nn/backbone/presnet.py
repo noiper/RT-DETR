@@ -233,9 +233,10 @@ class PResNet(nn.Module):
         return m
 
     def forward(self, x):
-        conv1 = self.conv1(x)
+        conv1 = self.conv1(x) # variant 'c' has 3 conv layers; variant 'd' has 1 conv layer
         x = F.max_pool2d(conv1, kernel_size=3, stride=2, padding=1)
         outs = []
+        # Resnet 18/34 uses BasicBlock; Resnet 50/101 uses BottleNeck.
         for idx, stage in enumerate(self.res_layers):
             x = stage(x)
             if idx in self.return_idx:

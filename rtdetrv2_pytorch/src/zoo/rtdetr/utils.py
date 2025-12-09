@@ -87,24 +87,28 @@ def deformable_attention_core_func_v2(\
     _, Len_q, _, _, _ = sampling_locations.shape
         
     split_shape = [h * w for h, w in value_spatial_shapes]
-    value_list = value.permute(0, 2, 3, 1).flatten(0, 1).split(split_shape, dim=-1)
+    value_list = value.permute(0, 2, 3, 1).flatten(0, 1).split(split_shape, dim=-1) # split to levels; i.e, 8400 -> [6400, 1600, 800]
 
-    # sampling_offsets [8, 480, 8, 12, 2]
     if method == 'default':
-        sampling_grids = 2 * sampling_locations - 1
+        sampling_grids = 2 * sampling_locations - 1 # center point to [-1, 1] range
 
     elif method == 'discrete':
         sampling_grids = sampling_locations
 
-    sampling_grids = sampling_grids.permute(0, 2, 1, 3, 4).flatten(0, 1)
-    sampling_locations_list = sampling_grids.split(num_points_list, dim=-2)
+    sampling_grids = sampling_grids.permute(0, 2, 1, 3, 4).flatten(0, 1) # (B * n_head, Len_q, 12, 2)
+    sampling_locations_list = sampling_grids.split(num_points_list, dim=-2) # length 3 list; each element: (B * n_head, Len_q, 4, 2)
 
     sampling_value_list = []
     for level, (h, w) in enumerate(value_spatial_shapes):
         value_l = value_list[level].reshape(bs * n_head, c, h, w)
         sampling_grid_l: torch.Tensor = sampling_locations_list[level]
 
-        if method == 'default':
+        if method == 'default': # used in RT-DETR
+            # Extract values in value_l according to sampling_grid_l.
+            # value_l shape: (B * n_head, C, h, w); sampling_grid_l shape: (B * n_head, Len_q, n_points, 2)
+            # Output shape: (B * n_head, C, Len_q, n_points)
+            # The value pair in sampling_grid_l are normalized to [-1, 1] range.
+            # Any value outside [-1, 1] will be filled with 0.
             sampling_value_l = F.grid_sample(
                 value_l, 
                 sampling_grid_l, 
@@ -127,11 +131,11 @@ def deformable_attention_core_func_v2(\
         
         sampling_value_list.append(sampling_value_l)
 
-    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, Len_q, sum(num_points_list))
+    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, Len_q, sum(num_points_list)) # (B * n_head, 1, Len_q, 12)
     weighted_sample_locs = torch.concat(sampling_value_list, dim=-1) * attn_weights
-    output = weighted_sample_locs.sum(-1).reshape(bs, n_head * c, Len_q)
+    output = weighted_sample_locs.sum(-1).reshape(bs, n_head * c, Len_q) # weighted sum over the 12 sampling points; shape: (B, 256, Len_q)
 
-    return output.permute(0, 2, 1)
+    return output.permute(0, 2, 1) # (B, Len_q, 256)
 
 
 def get_activation(act: str, inpace: bool=True):

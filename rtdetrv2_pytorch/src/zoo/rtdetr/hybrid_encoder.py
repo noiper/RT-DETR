@@ -188,8 +188,8 @@ class HybridEncoder(nn.Module):
     __share__ = ['eval_spatial_size', ]
 
     def __init__(self,
-                 in_channels=[512, 1024, 2048],
-                 feat_strides=[8, 16, 32],
+                 in_channels=[512, 1024, 2048], # backbone output channels
+                 feat_strides=[8, 16, 32], # reduction factors compared to input image
                  hidden_dim=256,
                  nhead=8,
                  dim_feedforward = 1024,
@@ -295,14 +295,14 @@ class HybridEncoder(nn.Module):
 
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
-        proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)] # map to hidden_dim
         
         # encoder
         if self.num_encoder_layers > 0:
             # self.use_encoder_idx = [2]: only pass the last layer from the backbone to encoder
             for i, enc_ind in enumerate(self.use_encoder_idx):
                 h, w = proj_feats[enc_ind].shape[2:]
-                # flatten [B, C, H, W] to [B, HxW, C]
+                # (B, C, H, W) -> (B, H*W, C)
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
                 if self.training or self.eval_spatial_size is None:
                     pos_embed = self.build_2d_sincos_position_embedding(
@@ -312,7 +312,7 @@ class HybridEncoder(nn.Module):
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
-        # Now proj_feats[2] is the encoder output; proj_feats[:2] are still backbone outputs.
+        # Now proj_feats[2] is the encoder output; proj_feats[:2] are still backbone outputs. [S3, S4, F5]
         
         # broadcasting and fusion (CCFF)
         inner_outs = [proj_feats[-1]]
@@ -326,9 +326,9 @@ class HybridEncoder(nn.Module):
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
         # Eventually, inner_outs stores the output of results after 2 lateral_convs and the final fusion in bottom-up path
-        # inner_outs[0].shape: [B, 256, 80, 80]
-        # inner_outs[1].shape: [B, 256, 40, 40]
-        # inner_outs[2].shape: [B, 256, 20, 20]
+        # inner_outs[0].shape: (B, hidden_dim, H/8, W/8)
+        # inner_outs[1].shape: (B, hidden_dim, H/16, W/16)
+        # inner_outs[2].shape: (B, hidden_dim, H/32, W/32)
 
         outs = [inner_outs[0]]
         # idx: 0->1
@@ -339,8 +339,9 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
             outs.append(out)
         # Eventually, outs stores the output of results after fusion blocks in top-down path
-        # outs[0].shape: [B, 256, 80, 80]
-        # outs[1].shape: [B, 256, 40, 40]
-        # outs[2].shape: [B, 256, 20, 20]
+        # Black arrow in the figure
+        # outs[0].shape: (B, hidden_dim, H/8, W/8)
+        # outs[1].shape: (B, hidden_dim, H/16, W/16)
+        # outs[2].shape: (B, hidden_dim, H/32, W/32)
 
         return outs

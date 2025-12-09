@@ -36,8 +36,8 @@ class DetSolver(BaseSolver):
                 self.train_dataloader.sampler.set_epoch(epoch)
             
             train_stats = train_one_epoch(
-                self.model, 
-                self.criterion, 
+                self.model, # RTDETR model "zoo/rtdetr/rtdetr.py"
+                self.criterion, # loss module "zoo/rtdetr/rtdetr_criterion.py"
                 self.train_dataloader, 
                 self.optimizer, 
                 self.device, 

@@ -45,12 +45,12 @@ class RTDETRCriterionv2(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
-        self.weight_dict = weight_dict
-        self.losses = losses 
+        self.weight_dict = weight_dict # i.e, {'loss_vfl': 1, 'loss_bbox': 5, 'loss_giou': 2}
+        self.losses = losses # i.e, ['vfl', 'boxes']
         self.boxes_weight_format = boxes_weight_format
         self.share_matched_indices = share_matched_indices
-        self.alpha = alpha
-        self.gamma = gamma
+        self.alpha = alpha # 0.75
+        self.gamma = gamma # 2.0
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -68,10 +68,10 @@ class RTDETRCriterionv2(nn.Module):
 
     def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
         assert 'pred_boxes' in outputs
-        idx = self._get_src_permutation_idx(indices)
+        idx = self._get_src_permutation_idx(indices) # tuple(batch_idx, src_idx)
         if values is None:
-            src_boxes = outputs['pred_boxes'][idx]
-            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+            src_boxes = outputs['pred_boxes'][idx] # （num_matched_boxes, 4)
+            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0) # (num_matched_boxes, 4)
             ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
             ious = torch.diag(ious).detach()
         else:
@@ -81,12 +81,12 @@ class RTDETRCriterionv2(nn.Module):
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
-        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+        target_classes[idx] = target_classes_o # matched pos: indexes; others: num_classes (no-object)
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1] # (B, num_queries, num_classes)
 
         target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
-        target_score_o[idx] = ious.to(target_score_o.dtype)
-        target_score = target_score_o.unsqueeze(-1) * target
+        target_score_o[idx] = ious.to(target_score_o.dtype) # matched pos: ious; others: 0
+        target_score = target_score_o.unsqueeze(-1) * target # use one-hot * ious instead of 1; vfl style
 
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
@@ -128,10 +128,11 @@ class RTDETRCriterionv2(nn.Module):
         return batch_idx, tgt_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        # Compute the loss specified by the loss name.
         loss_map = {
             'boxes': self.loss_boxes,
             'focal': self.loss_labels_focal,
-            'vfl': self.loss_labels_vfl,
+            'vfl': self.loss_labels_vfl, # Varifocal loss
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -201,7 +202,7 @@ class RTDETRCriterionv2(nn.Module):
                 for t in enc_targets:
                     t['labels'] = torch.zeros_like(t["labels"])
             else:
-                enc_targets = targets
+                enc_targets = targets # use this branch by default
 
             for i, aux_outputs in enumerate(outputs['enc_aux_outputs']):
                 matched = self.matcher(aux_outputs, targets)
