@@ -1,0 +1,88 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name":  "Python: Train RT-DETRv2 VisDrone",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_visdrone.yml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch"
+            }
+        },
+        {
+            "name":  "Python: Train RT-DETRv2 VisDrone (Single GPU)",
+            "type": "debugpy",
+            "request":  "launch",
+            "program":  "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_visdrone.yml",
+                "--use-amp"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch",
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
+        },
+        {
+            "name": "Python:  Train RT-DETRv2 (Custom Config)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "console":  "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "${input: configFile}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch"
+            }
+        },
+        {
+            "name":  "Python:  Eval RT-DETRv2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "console":  "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_visdrone. yml",
+                "--test-only",
+                "-r",
+                "${input:checkpointPath}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch"
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "configFile",
+            "type": "promptString",
+            "description": "Config file path (relative to RT-DETR root)",
+            "default": "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_visdrone.yml"
+        },
+        {
+            "id": "checkpointPath",
+            "type": "promptString",
+            "description": "Checkpoint path for evaluation",
+            "default": "rtdetrv2_pytorch/output/rtdetrv2_r18vd_visdrone/checkpoint_best.pth"
+        }
+    ]
+}
