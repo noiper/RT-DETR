@@ -6,41 +6,57 @@ __include__:  [
   './include/rtdetrv2_r50vd.yml',
 ]
 
-output_dir: ./output/rtdetrv2_r18vd_visdrone
+tuning: ./rtdetrv2_r18vd_120e_coco.pth
 
-# Override number of classes for VisDrone
-num_classes:  11
+output_dir: ./output/rtdetrv2_r18vd_visdrone_v3
 
-# Override ResNet depth to use ResNet-18
-PResNet:
+num_classes: 11
+
+# ⭐ NEW: Freeze ALL backbone stages
+PResNet: 
   depth: 18
-  freeze_at: -1
-  freeze_norm: False
-  pretrained: True
+  freeze_at: 4              # ⭐ Freeze ALL 4 stages (was 2)
+  freeze_norm: True
+  pretrained: False
 
-# Adjust encoder for ResNet-18 channels
 HybridEncoder:
   in_channels: [128, 256, 512]
   hidden_dim: 256
   expansion: 0.5
 
-# Lighter decoder for ResNet-18
 RTDETRTransformerv2:
   num_layers: 3
 
-epoches: 72
+# ⭐ NEW:  Shorter training since we're freezing more
+epoches: 20                 # Reduced from 30
 
-optimizer:
+# ⭐ NEW:  Simpler optimizer (no backbone LR needed)
+optimizer: 
   type: AdamW
-  params:
+  params: 
+    # Only norms - no weight decay
     - 
       params: '^(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
+  
+  lr: 0.0001                # Single LR for all trainable layers
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
 
-train_dataloader: 
-  dataset:  
+# ⭐ NEW: Earlier LR decay
+lr_scheduler:
+  type:  MultiStepLR
+  milestones: [12, 17]      # Decay at 12 and 17
+  gamma: 0.1
+
+lr_warmup_scheduler: 
+  type: LinearWarmup
+  warmup_duration: 2        # Very short warmup
+
+train_dataloader:
+  dataset:
     transforms:
       policy:
-        epoch: 69
+        epoch: 17           # Stop augmentation earlier
   collate_fn: 
     scales: ~
