@@ -10,7 +10,7 @@ from typing import Optional, Callable
 from collections import defaultdict
 
 from ._dataset import DetDataset
-from . ._misc import convert_to_tv_tensor
+from .._misc import convert_to_tv_tensor
 from ... core import register
 
 @register()
@@ -19,7 +19,7 @@ class VisdroneVIDDetection(DetDataset):
     VisDrone VID Dataset for object detection (treating video frames as images)
     
     Args:
-        root_dir: Root directory containing video folders
+        root_dir:  Root directory containing video folders
         ann_dir: Directory containing annotation files (one . txt per video)
         transforms: Transform pipeline
         image_set: 'train' or 'val'
@@ -70,7 +70,7 @@ class VisdroneVIDDetection(DetDataset):
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.ann_dir = os.path.abspath(os.path.expanduser(ann_dir))
         self._transforms = transforms
-        self. image_set = image_set
+        self.image_set = image_set
         self.remap_mscoco_category = remap_mscoco_category
         
         # Debug:  Print paths
@@ -102,13 +102,13 @@ class VisdroneVIDDetection(DetDataset):
         ann_file = os.path.join(self.ann_dir, f"{video_name}.txt")
         
         if not os.path.exists(ann_file):
-            print(f"Warning:  Annotation file not found: {ann_file}")
+            print(f"Warning: Annotation file not found: {ann_file}")
             return {}
         
         frame_annotations = defaultdict(list)
         
         with open(ann_file, 'r') as f:
-            for line in f:
+            for line in f: 
                 line = line.strip()
                 if not line:
                     continue
@@ -147,11 +147,11 @@ class VisdroneVIDDetection(DetDataset):
             return
         
         if not os.path.exists(self.ann_dir):
-            print(f"ERROR: Annotation directory does not exist: {self.ann_dir}")
+            print(f"ERROR:  Annotation directory does not exist: {self.ann_dir}")
             return
         
         # List all items in root_dir
-        all_items = os.listdir(self.root_dir)
+        all_items = os.listdir(self. root_dir)
         
         # Get only directories (video folders)
         video_dirs = [os.path.join(self.root_dir, d) for d in all_items 
@@ -225,13 +225,20 @@ class VisdroneVIDDetection(DetDataset):
         # Parse annotations
         boxes = []
         labels = []
+        areas = []
+        iscrowd = []
         
-        for ann in sample['annotations']: 
+        for ann in sample['annotations']:
             x, y, w_box, h_box = ann['bbox']
             category = ann['category']
+            score = ann['score']
             
             # Skip ignored regions (category 0) and invalid boxes
             if category == 0 or w_box <= 0 or h_box <= 0:
+                continue
+            
+            # Skip boxes with score 0 (not considered in evaluation)
+            if score == 0:
                 continue
             
             # Convert to [x1, y1, x2, y2] format
@@ -248,19 +255,29 @@ class VisdroneVIDDetection(DetDataset):
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(category)
+                # Calculate area
+                areas.append((x2 - x1) * (y2 - y1))
+                # VisDrone doesn't have crowd annotations, set to 0
+                iscrowd.append(0)
         
         # Convert to tensors
         if len(boxes) == 0:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.int64)
+            areas = torch. zeros((0,), dtype=torch.float32)
+            iscrowd = torch.zeros((0,), dtype=torch.int64)
         else:
             boxes = torch.as_tensor(boxes, dtype=torch.float32)
             labels = torch.as_tensor(labels, dtype=torch.int64)
+            areas = torch.as_tensor(areas, dtype=torch.float32)
+            iscrowd = torch.as_tensor(iscrowd, dtype=torch. int64)
         
         # Create target dict
         target = {
             'boxes': boxes,
-            'labels': labels,
+            'labels':  labels,
+            'area': areas,  # Added for COCO evaluator
+            'iscrowd': iscrowd,  # Added for COCO evaluator
             'orig_size': torch.as_tensor([w, h]),
             'image_id': torch.tensor([idx]),
             'idx': torch.tensor([idx]),
