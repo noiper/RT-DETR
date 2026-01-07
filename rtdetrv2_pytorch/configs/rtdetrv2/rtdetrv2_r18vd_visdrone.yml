@@ -6,57 +6,78 @@ __include__:  [
   './include/rtdetrv2_r50vd.yml',
 ]
 
-tuning: ./rtdetrv2_r18vd_120e_coco.pth
+tuning:  ./rtdetrv2_r18vd_120e_coco.pth
 
-output_dir: ./output/rtdetrv2_r18vd_visdrone_v3
+output_dir: ./output/rtdetrv2_r18vd_visdrone_v4
 
 num_classes: 11
 
-# ⭐ NEW: Freeze ALL backbone stages
-PResNet: 
+# ⭐ KEY CHANGE: Only freeze early stages
+PResNet:  
   depth: 18
-  freeze_at: 4              # ⭐ Freeze ALL 4 stages (was 2)
-  freeze_norm: True
+  freeze_at: 1              # ⭐ Only freeze stage 1 (was 4!)
+  freeze_norm: False        # ⭐ Allow BN to adapt
   pretrained: False
 
 HybridEncoder:
   in_channels: [128, 256, 512]
   hidden_dim: 256
-  expansion: 0.5
+  expansion:  0.5
 
 RTDETRTransformerv2:
   num_layers: 3
 
-# ⭐ NEW:  Shorter training since we're freezing more
-epoches: 20                 # Reduced from 30
+# ⭐ More epochs since we're training more
+epoches: 40                 # Increased from 20
 
-# ⭐ NEW:  Simpler optimizer (no backbone LR needed)
+# ⭐ Differential LR for unfrozen backbone
 optimizer: 
   type: AdamW
   params: 
-    # Only norms - no weight decay
+    # Unfrozen backbone stages 2-4 - small LR
     - 
-      params: '^(?=.*(?:norm|bn)).*$'
+      params: '^(?=.*backbone\.layer[234])(?!.*(?:norm|bn)).*$'
+      lr: 0.000005          # ⭐ Very small (5e-6)
+    # Backbone norms - small LR, no decay
+    - 
+      params:  '^(?=.*backbone)(?=.*(?:norm|bn)).*$'
+      lr: 0.000005
+      weight_decay: 0.
+    # Encoder/Decoder norms - no decay
+    - 
+      params:  '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
   
-  lr: 0.0001                # Single LR for all trainable layers
+  lr:  0.0001                # Encoder/decoder
   betas: [0.9, 0.999]
   weight_decay: 0.0001
 
-# ⭐ NEW: Earlier LR decay
+# ⭐ Adjusted LR schedule
 lr_scheduler:
-  type:  MultiStepLR
-  milestones: [12, 17]      # Decay at 12 and 17
+  type: MultiStepLR
+  milestones: [25, 35]      # Later milestones
   gamma: 0.1
 
-lr_warmup_scheduler: 
+lr_warmup_scheduler:  
   type: LinearWarmup
-  warmup_duration: 2        # Very short warmup
+  warmup_duration: 5        # Longer warmup
 
+# ⭐ CRITICAL:  Add multi-scale training for small objects
 train_dataloader:
-  dataset:
+  dataset: 
     transforms:
-      policy:
-        epoch: 17           # Stop augmentation earlier
+      policy: 
+        epoch:  35
   collate_fn: 
-    scales: ~
+    scales: [
+      [480, 480],
+      [512, 512],
+      [544, 544],
+      [576, 576],
+      [608, 608],
+      [640, 640],
+      [672, 672],
+      [704, 704],
+      [736, 736]
+    ]
+    stop_epoch: 35
