@@ -159,12 +159,16 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Dataset
+datasets/
 
 .DS_Store
 *.ipynb
 *.pth 
 *.pdparams
 *.onnx
+*.err
+*.out
 test.py
 rtdetr_pytorch/output/
 rtdetr_pytorch/dataset/
