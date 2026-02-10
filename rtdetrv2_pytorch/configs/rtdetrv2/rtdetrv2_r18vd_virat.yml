@@ -1,0 +1,75 @@
+__include__: [
+  '../dataset/virat_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+tuning: ./rtdetrv2_r18vd_120e_coco.pth
+output_dir: ./output/rtdetrv2_r18vd_virat_v2
+
+num_classes: 5
+
+# ResNet-18 backbone
+PResNet: 
+  depth: 18
+  freeze_at: 4  # ⭐ Freeze MORE layers (back to 4)
+  freeze_norm: True
+  pretrained: False
+
+HybridEncoder:
+  in_channels: [128, 256, 512]
+  hidden_dim: 256
+  expansion: 0.5
+  dropout: 0.1  # ⭐ Add dropout if supported
+
+RTDETRTransformerv2:
+  num_layers: 3
+  num_denoising: 0
+  dropout: 0.1  # ⭐ Add dropout if supported
+
+epoches: 60  # ⭐ Train longer with early stopping
+use_focal_loss: True
+
+# ⭐ Stronger regularization
+optimizer:
+  type: AdamW
+  params:
+    - 
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.000005  # ⭐ Even lower backbone LR
+    - 
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00005  # ⭐ Lower overall LR
+  betas: [0.9, 0.999]
+  weight_decay: 0.001  # ⭐ Higher weight decay (10x)
+
+# ⭐ Gentler LR schedule
+LRScheduler:
+  type: MultiStepLR
+  milestones: [40, 50]  # ⭐ Later decay
+  gamma: 0.1
+
+LRWarmup:
+  type: LinearWarmup
+  warmup_duration: 5  # ⭐ Longer warmup
+
+# ⭐ Smaller batch size = more noise = better regularization
+train_dataloader: 
+  total_batch_size: 8  # ⭐ Reduce from 16
+  shuffle: true
+  num_workers: 4
+  drop_last: true
+  dataset: 
+    transforms:
+      policy:
+        name: stop_epoch
+        epoch: 55  # ⭐ Keep augmentation longer
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop', 'RandomHorizontalFlip']
+  collate_fn:
+    scales: ~
+
+val_dataloader:
+  total_batch_size: 8
