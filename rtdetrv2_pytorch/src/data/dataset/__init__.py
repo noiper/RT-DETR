@@ -16,3 +16,4 @@ from .voc_detection import VOCDetection
 from .voc_eval import VOCEvaluator
 
 from .visdrone_dataset import VisdroneVIDDetection
+from .virat_dataset import ViratDetection
