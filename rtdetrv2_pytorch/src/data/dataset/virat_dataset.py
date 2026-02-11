@@ -37,17 +37,10 @@ class ViratDetection(DetDataset):
         self.remap_mscoco_category = remap_mscoco_category
         self.debug_size = debug_size
         
-        print(f"\n=== VIRAT Dataset Init ===")
-        print(f"Image folder: {self.img_folder}")
-        print(f"Annotation file: {self.ann_file}")
         if debug_size > 0:
             print(f"⚠️  DEBUG MODE: Using only {debug_size} samples")
         
         self._load_annotations()
-        
-        print(f"Loaded {len(self.image_list)} images from VIRAT {image_set} set")
-        print(f"Number of categories: {len(self.categories)}")
-        print(f"Categories: {[cat['name'] for cat in self.categories]}")
     
     def _load_annotations(self):
         """Load COCO-format JSON annotations"""

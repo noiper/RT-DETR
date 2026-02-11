@@ -7,7 +7,7 @@ __include__: [
 ]
 
 tuning: ./rtdetrv2_r18vd_120e_coco.pth
-output_dir: ./output/rtdetrv2_r18vd_virat_v2
+output_dir: ./output/rtdetrv2_r18vd_virat_v3
 
 num_classes: 5
 
@@ -29,7 +29,7 @@ RTDETRTransformerv2:
   num_denoising: 0
   dropout: 0.1  # ⭐ Add dropout if supported
 
-epoches: 60  # ⭐ Train longer with early stopping
+epoches: 5
 use_focal_loss: True
 
 # ⭐ Stronger regularization
