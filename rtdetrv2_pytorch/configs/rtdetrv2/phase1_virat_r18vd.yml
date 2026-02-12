@@ -2,7 +2,6 @@
 
 __include__: [
   '../dataset/virat_phase1_detection.yml',
-  # Remove './include/dataloader.yml' - we define dataloader in virat_phase1_detection.yml
   './include/optimizer.yml',
   './include/rtdetrv2_r50vd.yml',
 ]

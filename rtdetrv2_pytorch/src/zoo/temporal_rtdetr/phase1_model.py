@@ -28,7 +28,7 @@ class TemporalRTDETR(nn.Module):
     ):
         """
         Args:
-            backbone: RT-DETR backbone (e.g., ResNet + FPN)
+            backbone: RT-DETR backbone (e.g., ResNet 18)
             encoder: RT-DETR encoder (Hybrid Encoder)
             decoder: RT-DETR decoder
             num_decoder_layers: Number of decoder layers for key frames
@@ -69,17 +69,10 @@ class TemporalRTDETR(nn.Module):
             ccff_features: Cross-scale concatenated features from encoder
             decoder_queries: Object queries from decoder (or None)
         """
-        # Extract multi-scale features
         features = self.backbone(images)
-        
-        # Encode features (Intra-scale + Cross-scale fusion)
-        # Returns CCFF features (Cross-scale Concatenated Features)
         ccff_features = self.encoder(features)
-        
-        # Decode with full decoder layers
         outputs = self.decoder(ccff_features, targets=targets)
         
-        # Cache CCFF features for potential reuse
         self.cached_ccff_features = ccff_features
         
         # For Phase 1, we don't actually need to extract decoder queries
