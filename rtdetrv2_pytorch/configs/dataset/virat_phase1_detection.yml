@@ -1,0 +1,60 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', ]
+
+num_classes: 5
+remap_mscoco_category: False
+
+# Phase 1 temporal training specific
+max_frame_gap: 10
+
+train_dataloader: 
+  type: DataLoader
+  dataset: 
+    type: ViratTemporalDataset
+    root_dir: ../dataset/VIRAT/train_videos/
+    ann_file: ../dataset/VIRAT/train.json
+    max_frame_gap: 10
+    return_pair: True
+    return_masks: False
+    # Pair sampling strategies:
+    # - "all": All possible gaps (most pairs, slowest) ~339k pairs
+    # - "random_single": One random gap per frame (balanced) ~34k pairs
+    # - "fixed_gap": Only max_frame_gap (specific gap) ~31k pairs
+    # - "stride": Key frames every N frames, fixed gap (smallest) ~6.2k pairs (stride=5)
+    # - "stride_random": Key frames every N frames, random gap (efficient + diverse) ~6.2k pairs (stride=5)
+    pair_sampling_strategy: "random_single"  # Change this to experiment
+    frame_stride: 5  # Only used for "stride" and "stride_random" strategies
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 4
+  drop_last: True
+  batch_size: 4
+  collate_fn:
+    type: TemporalBatchCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset: 
+    type: ViratTemporalDataset
+    root_dir: ../dataset/VIRAT/val_videos/
+    ann_file: ../dataset/VIRAT/val.json
+    max_frame_gap: 10
+    return_pair: False
+    return_masks: False
+    pair_sampling_strategy: "fixed_gap"  # Use fixed gap for validation
+    frame_stride: 1
+    transforms:
+      type: Compose
+      ops: ~ 
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  batch_size: 4
+  collate_fn:
+    type: TemporalBatchCollateFunction

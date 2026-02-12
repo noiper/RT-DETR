@@ -1,0 +1,34 @@
+# Phase 1 Temporal RT-DETR Training Configuration for VIRAT Dataset
+
+__include__: [
+  '../dataset/virat_phase1_detection.yml',
+  # Remove './include/dataloader.yml' - we define dataloader in virat_phase1_detection.yml
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+# Override num_classes from dataset config
+RTDETRTransformer:
+  num_classes: ${num_classes}
+
+# Phase 1 Temporal Training Specific Parameters
+lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
+
+# Training Settings
+epoches: 50
+clip_max_norm: 0.1
+
+# Learning Rate Scheduler (override)
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [30, 40]
+  gamma: 0.1
+
+# Logging and Checkpointing
+print_freq: 50
+checkpoint_freq: 5
+output_dir: './output/phase1_virat_r18vd'
+summary_dir: './output/phase1_virat_r18vd/summary'
+
+# Random seed
+seed: 42

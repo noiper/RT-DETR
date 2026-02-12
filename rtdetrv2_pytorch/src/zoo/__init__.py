@@ -3,3 +3,4 @@
 
 
 from . import rtdetr
+from . import temporal_rtdetr

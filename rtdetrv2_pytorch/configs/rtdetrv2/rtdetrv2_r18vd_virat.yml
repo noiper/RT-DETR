@@ -7,7 +7,7 @@ __include__: [
 ]
 
 tuning: ./rtdetrv2_r18vd_120e_coco.pth
-output_dir: ./output/rtdetrv2_r18vd_virat_v3
+output_dir: ./output/rtdetrv2_r18vd_virat_v4
 
 num_classes: 5
 
@@ -58,7 +58,7 @@ LRWarmup:
 
 # ⭐ Smaller batch size = more noise = better regularization
 train_dataloader: 
-  total_batch_size: 8  # ⭐ Reduce from 16
+  total_batch_size: 8
   shuffle: true
   num_workers: 4
   drop_last: true

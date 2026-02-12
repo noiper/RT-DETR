@@ -26,7 +26,6 @@ class ViratDetection(DetDataset):
         transforms: Optional[Callable] = None,
         image_set: str = 'train',
         remap_mscoco_category: bool = False,
-        debug_size: int = -1,
     ):
         super().__init__()
         
@@ -35,10 +34,6 @@ class ViratDetection(DetDataset):
         self._transforms = transforms
         self.image_set = image_set
         self.remap_mscoco_category = remap_mscoco_category
-        self.debug_size = debug_size
-        
-        if debug_size > 0:
-            print(f"⚠️  DEBUG MODE: Using only {debug_size} samples")
         
         self._load_annotations()
     
@@ -81,9 +76,6 @@ class ViratDetection(DetDataset):
         
         # Create image list
         self.image_list = sorted(self.images.keys())
-        
-        if self.debug_size > 0:
-            self.image_list = self.image_list[:self.debug_size]
         
         print(f"Total images: {len(self.image_list)}")
         print(f"Valid annotations: {len(valid_annotations)}")
