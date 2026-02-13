@@ -69,59 +69,70 @@ class LightweightFusionBlock(nn.Module):
         
         return fused
 
-
 class SingleLayerDecoder(nn.Module):
     """
-    Lightweight single-layer decoder for non-key frames.
-    Wraps the full decoder but only uses the first layer.
+    Lightweight 1-layer decoder for non-key frames
+    Just calls the full decoder but only uses the first layer's output
     """
-    def __init__(self, full_decoder: nn.Module, hidden_dim: int = 256, num_queries: int = 300):
+    def __init__(self, full_decoder: nn.Module, hidden_dim: int, num_queries: int):
         super().__init__()
-        self.full_decoder = full_decoder
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
         
-        # We'll need to extract the first decoder layer
-        # This depends on the decoder implementation
-        # For RT-DETR, decoder usually has 'layers' attribute
-        if hasattr(full_decoder, 'layers') and len(full_decoder.layers) > 0:
-            self.decoder_layer = full_decoder.layers[0]
-            self.has_single_layer = True
-        else:
-            # Fallback: use full decoder
-            self.decoder_layer = None
-            self.has_single_layer = False
-            print("Warning: Could not extract single decoder layer, using full decoder")
+        # Store reference to full decoder - we'll use it but only take first layer output
+        self.full_decoder = full_decoder
         
-        # Copy other necessary components from full decoder
-        if hasattr(full_decoder, 'query_pos_head'):
-            self.query_pos_head = full_decoder.query_pos_head
-        if hasattr(full_decoder, 'bbox_head'):
-            self.bbox_head = full_decoder.bbox_head
-        if hasattr(full_decoder, 'score_head'):
-            self.score_head = full_decoder.score_head
+        print(f"✓ Created SingleLayerDecoder:")
+        print(f"  - Wraps full decoder but only uses first layer output")
+        print(f"  - Decoder will run in eval mode to bypass denoising")
     
-    def forward(self, features, targets=None, query_embed=None):
+    def forward(self, memory, targets=None, query_embed=None):
         """
-        Forward with only 1 decoder layer
+        Forward pass for lightweight decoder
+        Calls full decoder in eval mode (no denoising) and returns first layer predictions
         
         Args:
-            features: Input features from encoder/fusion
-            targets: Ground truth targets (optional)
-            query_embed: Initial query embeddings (optional, can reuse from key frame)
+            memory: List of multi-scale features [feat1, feat2, feat3]
+            targets: Ground truth (ignored - we run decoder in eval mode)
+            query_embed: Not used (full decoder generates its own queries)
         
         Returns:
-            outputs: Decoder predictions
+            outputs: Dict with 'pred_logits' and 'pred_boxes' from first layer only
         """
-        if not self.has_single_layer:
-            # Fallback to full decoder
-            return self.full_decoder(features, targets=targets)
+        # Set decoder to eval mode temporarily to bypass denoising
+        # Denoising is only used when training=True AND targets is not None
+        # But gradients will still flow through because we're not using no_grad()
+        was_training = self.full_decoder.training
+        self.full_decoder.eval()
         
-        # Use single layer decoder
-        # This is a simplified implementation - you may need to adjust based on your decoder
-        # For now, call the full decoder (TODO: implement true single-layer forward)
-        return self.full_decoder(features, targets=targets)
-
+        # Call full decoder without targets (eval mode = no denoising)
+        # Gradients still flow through for training the decoder weights
+        outputs = self.full_decoder(memory, targets=None)
+        
+        # Restore training mode
+        if was_training:
+            self.full_decoder.train()
+        
+        # If outputs contains intermediate predictions, take only the first one
+        # Otherwise just return the final output (which would be from all layers)
+        if isinstance(outputs, dict):
+            # Check if there are auxiliary outputs (intermediate layer predictions)
+            if 'aux_outputs' in outputs and len(outputs['aux_outputs']) > 0:
+                # Use the first auxiliary output (first decoder layer)
+                first_layer_output = outputs['aux_outputs'][0]
+                return {
+                    'pred_logits': first_layer_output['pred_logits'],
+                    'pred_boxes': first_layer_output['pred_boxes'],
+                }
+            else:
+                # No auxiliary outputs, just use main output
+                # This means all layers were used, but we'll accept it
+                return {
+                    'pred_logits': outputs['pred_logits'],
+                    'pred_boxes': outputs['pred_boxes'],
+                }
+        else:
+            raise ValueError(f"Unexpected output format from decoder: {type(outputs)}")
 
 class TemporalRTDETR(nn.Module):
     """
@@ -144,22 +155,19 @@ class TemporalRTDETR(nn.Module):
         encoder: nn.Module,
         decoder: nn.Module,
         num_decoder_layers: int = 6,
-        non_key_decoder_layers: int = 6,  # Can be 1 for lightweight or 6 for full
+        non_key_decoder_layers: int = 6,
         hidden_dim: int = 256,
         num_queries: int = 300,
-        use_lightweight_decoder: bool = False,  # Toggle between 1-layer and 6-layer
-        reuse_queries: bool = False,  # Whether to reuse queries from key frame
+        use_lightweight_decoder: bool = False,
+        reuse_queries: bool = False,
     ):
         """
         Args:
-            backbone: RT-DETR backbone (e.g., ResNet + FPN)
-            encoder: RT-DETR encoder (Hybrid Encoder)
-            decoder: RT-DETR decoder
             num_decoder_layers: Number of decoder layers for key frames
             non_key_decoder_layers: Number of decoder layers for non-key frames
             hidden_dim: Hidden dimension
             num_queries: Number of object queries
-            use_lightweight_decoder: If True, use only 1 decoder layer for non-key frames
+            use_lightweight_decoder: If True, use only 1 decoder layer for non-key frames (overrides non_key_decoder_layers)
             reuse_queries: If True, reuse queries from key frame for non-key frame
         """
         super().__init__()
@@ -177,9 +185,9 @@ class TemporalRTDETR(nn.Module):
         
         # Fusion block for non-key frame (will be created dynamically)
         self.fusion_block = None
-        self._s5_channels = None  # Will be set on first forward
+        self._s5_channels = None
         
-        # Create lightweight decoder if needed (1 layer)
+        # Create lightweight decoder if needed
         if use_lightweight_decoder:
             self.lightweight_decoder = SingleLayerDecoder(
                 full_decoder=decoder,

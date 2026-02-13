@@ -1,6 +1,6 @@
 """
 Phase 1 Training Script for Temporal RT-DETR
-Run with: python rtdetrv2_pytorch/tools/phase1_training.py --config rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml --data_root <path> --ann_file <path>
+Run with: python rtdetrv2_pytorch/tools/phase1_training.py -c rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml --pretrained best.pth --training_strategy freeze_key
 """
 
 import os 
@@ -23,15 +23,10 @@ from src.core import YAMLConfig
 
 class Phase1Trainer:
     """
-    Trainer for Phase 1: Object Detection Training with Key/Non-Key Frame Pairs
-    
     Training Strategies:
     - 'alternate': Alternate between key and non-key frame training (like Faster R-CNN)
     - 'freeze_key': Freeze key frame path, only train non-key path
-    - 'joint': Train both paths together (original)
-    
-    NOTE: In Phase 1, both paths share backbone/encoder, only decoder differs.
-    So "freezing key" only freezes the decoder, backbone/encoder remain trainable.
+    - 'joint': Train both paths together (dafault)
     """
     def __init__(
         self,
@@ -64,23 +59,25 @@ class Phase1Trainer:
         if training_strategy == 'alternate':
             print(f"  Alternate interval: {alternate_interval} epoch(s)")
             print(f"  Note: Backbone/Encoder/Fusion shared, only decoder alternates")
-        elif training_strategy == 'freeze_key':
-            print(f"  Freeze key frame decoder, train non-key frame path only")
-            # Freeze the full decoder (used by key frame)
+        elif self.training_strategy == 'freeze_key':
+            print(f"  Training mode: Non-key frame only (Fusion + Lightweight decoder)")
+            
+            # Freeze the key-frame path
+            for param in self.model.backbone.parameters():
+                param.requires_grad = False
+            for param in self.model.encoder.parameters():
+                param.requires_grad = False
             for param in self.model.decoder.parameters():
                 param.requires_grad = False
-            print(f"  ✓ Froze key frame decoder (6-layer)")
             
-            # Ensure lightweight decoder is trainable if it exists
+            # Make sure lightweight decoder and fusion block (if exists) are trainable
             if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
                 for param in self.model.lightweight_decoder.parameters():
                     param.requires_grad = True
-                print(f"  ✓ Lightweight decoder (1-layer) is trainable")
-            
-            # Ensure backbone and fusion block are trainable
-            for param in self.model.backbone.parameters():
-                param.requires_grad = True
-            print(f"  ✓ Backbone is trainable")
+            if hasattr(self.model, 'fusion_block') and self.model.fusion_block is not None:
+                for param in self.model.fusion_block.parameters():
+                    param.requires_grad = True
+
         elif training_strategy == 'joint':
             print(f"  Training both key and non-key paths jointly")
         else:
@@ -94,9 +91,6 @@ class Phase1Trainer:
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """
         Train one epoch with temporal frame pairs
-        
-        Since both paths share backbone/encoder, we only alternate the decoder.
-        Backbone and encoder always receive gradients from whichever path is active.
         """
         self.model.train()
         
@@ -115,11 +109,9 @@ class Phase1Trainer:
                 self._set_decoder_trainable(False)
                 
         elif self.training_strategy == 'freeze_key':
-            # Only train non-key frame path (key frame decoder frozen)
-            print(f"  Training mode: Non-key frame only (key frame decoder frozen)")
             train_key = False
             train_non_key = True
-            # Freeze only the main decoder (6-layer), keep lightweight decoder trainable
+            # Freeze only the main decoder (3-layer), keep lightweight decoder trainable
             for param in self.model.decoder.parameters():
                 param.requires_grad = False
             if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
@@ -479,24 +471,24 @@ def build_model_from_config(config_path: str, device: torch.device):
         raise ValueError("Model must have encoder and decoder components")
     
     # Get model config
-    num_decoder_layers = 6
+    num_decoder_layers = 3
     hidden_dim = 256
     num_queries = 300
     if 'RTDETRTransformerv2' in cfg.yaml_cfg:
         decoder_cfg = cfg.yaml_cfg['RTDETRTransformerv2']
-        num_decoder_layers = decoder_cfg.get('num_layers', 6)
+        num_decoder_layers = decoder_cfg.get('num_layers', 3)
         hidden_dim = decoder_cfg.get('hidden_dim', 256)
         num_queries = decoder_cfg.get('num_queries', 300)
     elif 'RTDETRTransformer' in cfg.yaml_cfg:
         decoder_cfg = cfg.yaml_cfg['RTDETRTransformer']
-        num_decoder_layers = decoder_cfg.get('num_decoder_layers', decoder_cfg.get('num_layers', 6))
+        num_decoder_layers = decoder_cfg.get('num_decoder_layers', decoder_cfg.get('num_layers', 3))
         hidden_dim = decoder_cfg.get('hidden_dim', 256)
         num_queries = decoder_cfg.get('num_queries', 300)
     
     # Get Phase 1 specific parameters
     use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
     reuse_queries = cfg.yaml_cfg.get('reuse_queries', False)
-    non_key_decoder_layers = cfg.yaml_cfg.get('non_key_decoder_layers', 6)
+    non_key_decoder_layers = cfg.yaml_cfg.get('non_key_decoder_layers', 3)
     
     # Create temporal model
     temporal_model = TemporalRTDETR(
@@ -527,8 +519,7 @@ def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, devic
         state_dict = checkpoint['model_state_dict']
     else:
         state_dict = checkpoint
-    
-    # Load weights (strict=False to allow missing keys for new components)
+
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
     if missing_keys:
@@ -536,7 +527,7 @@ def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, devic
     if unexpected_keys:
         print(f"  Unexpected keys: {len(unexpected_keys)}")
     
-    print(f"✓ Loaded pretrained key frame path")
+    print(f"  Success!")
 
 
 class DebugSubsetDataLoader:
@@ -563,11 +554,11 @@ def main():
     parser.add_argument('--config', '-c', type=str, required=True)
     parser.add_argument('--training_strategy', type=str, default='joint',
                        choices=['alternate', 'freeze_key', 'joint'],
-                       help='alternate (decoder only), freeze_key (only non-key), or joint (both)')
+                       help='alternate, freeze_key, or joint')
     parser.add_argument('--alternate_interval', type=int, default=1,
                        help='Alternate strategy only: switch every N epochs')
     parser.add_argument('--pretrained', type=str, default=None,
-                       help='Path to pretrained key frame model (e.g., standard RT-DETR checkpoint)')
+                       help='Path to pretrained key frame model')
     
     # Debug mode
     parser.add_argument('--debug', action='store_true')
@@ -598,7 +589,6 @@ def main():
     print("Loading configuration and building model...")
     try:
         model, cfg = build_model_from_config(args.config, device)
-        print("Model built successfully")
 
         if args.pretrained:
             load_pretrained_key_frame(model, args.pretrained, device)
@@ -661,13 +651,8 @@ def main():
     
     # Get components from config
     criterion = cfg.criterion
-    print(f"Criterion loaded from config")
-    
     optimizer = cfg.optimizer
-    print(f"Optimizer loaded from config")
-    
     lr_scheduler = cfg.lr_scheduler
-    print(f"LR Scheduler loaded from config")
     
     # Resume
     start_epoch = 0

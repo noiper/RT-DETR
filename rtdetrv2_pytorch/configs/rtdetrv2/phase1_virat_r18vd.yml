@@ -35,9 +35,9 @@ RTDETRTransformer:
 lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
 
 # Non-key frame decoder configuration
-use_lightweight_decoder: False  # True: 1-layer decoder, False: 3-layer decoder (full)
-reuse_queries: False            # True: reuse queries from key frame (experimental)
-non_key_decoder_layers: 3       # Number of layers for non-key decoder (1 or 3)
+use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)
+reuse_queries: True            # True: reuse queries from key frame (experimental)
+non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
 epoches: 50
