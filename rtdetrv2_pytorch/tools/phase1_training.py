@@ -44,7 +44,7 @@ class Phase1Trainer:
         output_dir: str = 'output',
         print_freq: int = 50,
         clip_max_norm: float = 0.1,
-        training_strategy: str = 'alternate',
+        training_strategy: str = 'joint',
         alternate_interval: int = 1,
     ):
         self.model = model
@@ -63,13 +63,28 @@ class Phase1Trainer:
         print(f"\nTraining Strategy: {training_strategy}")
         if training_strategy == 'alternate':
             print(f"  Alternate interval: {alternate_interval} epoch(s)")
-            print(f"  Note: Backbone/Encoder shared, only decoder alternates")
+            print(f"  Note: Backbone/Encoder/Fusion shared, only decoder alternates")
         elif training_strategy == 'freeze_key':
-            print(f"  Key frame decoder is FROZEN")
-            # Only freeze decoder (backbone/encoder are shared and need gradients)
+            print(f"  Freeze key frame decoder, train non-key frame path only")
+            # Freeze the full decoder (used by key frame)
             for param in self.model.decoder.parameters():
                 param.requires_grad = False
-            print(f"  ✓ Froze decoder (backbone/encoder remain trainable)")
+            print(f"  ✓ Froze key frame decoder (6-layer)")
+            
+            # Ensure lightweight decoder is trainable if it exists
+            if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
+                for param in self.model.lightweight_decoder.parameters():
+                    param.requires_grad = True
+                print(f"  ✓ Lightweight decoder (1-layer) is trainable")
+            
+            # Ensure backbone and fusion block are trainable
+            for param in self.model.backbone.parameters():
+                param.requires_grad = True
+            print(f"  ✓ Backbone is trainable")
+        elif training_strategy == 'joint':
+            print(f"  Training both key and non-key paths jointly")
+        else:
+            raise ValueError(f"Invalid strategy: {training_strategy}")
         
     def _set_decoder_trainable(self, trainable: bool):
         """Enable/disable gradient for decoder only"""
@@ -100,10 +115,16 @@ class Phase1Trainer:
                 self._set_decoder_trainable(False)
                 
         elif self.training_strategy == 'freeze_key':
-            # Only train non-key frame path (decoder frozen)
-            print(f"  Training mode: Non-key frame only (decoder frozen)")
+            # Only train non-key frame path (key frame decoder frozen)
+            print(f"  Training mode: Non-key frame only (key frame decoder frozen)")
             train_key = False
             train_non_key = True
+            # Freeze only the main decoder (6-layer), keep lightweight decoder trainable
+            for param in self.model.decoder.parameters():
+                param.requires_grad = False
+            if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
+                for param in self.model.lightweight_decoder.parameters():
+                    param.requires_grad = True
             
         elif self.training_strategy == 'joint':
             # Train both paths together
@@ -129,9 +150,9 @@ class Phase1Trainer:
             img_key = img_key.to(self.device)
             img_non_key = img_non_key.to(self.device)
             target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                          for k, v in t.items()} for t in target_key]
+                        for k, v in t.items()} for t in target_key]
             target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                              for k, v in t.items()} for t in target_non_key]
+                            for k, v in t.items()} for t in target_non_key]
             
             self.optimizer.zero_grad()
             
@@ -150,6 +171,14 @@ class Phase1Trainer:
             
             # Forward non-key frame
             if train_non_key:
+                # IMPORTANT: If we're not training key frame, we still need to forward it
+                # to cache CCFF features, but without computing gradients
+                if not train_key:
+                    with torch.no_grad():
+                        # Forward key frame just to cache CCFF
+                        # Pass targets to avoid denoising issues
+                        _, _, _ = self.model.forward_key_frame(img_key, target_key)
+                
                 outputs_non_key = self.model.forward_non_key_frame(img_non_key, target_non_key)
                 loss_dict_non_key = self.criterion(outputs_non_key, target_non_key)
                 loss_non_key = sum(loss_dict_non_key.values())
@@ -182,14 +211,14 @@ class Phase1Trainer:
             if batch_idx % self.print_freq == 0:
                 if train_key and train_non_key:
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} "
-                          f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f})")
+                        f"Loss: {loss.item():.4f} "
+                        f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f})")
                 elif train_key:
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Key only)")
+                        f"Loss: {loss.item():.4f} (Key only)")
                 else:
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Non-Key only)")
+                        f"Loss: {loss.item():.4f} (Non-Key only)")
         
         # Average losses
         avg_loss = total_loss / len(self.dataloader)
