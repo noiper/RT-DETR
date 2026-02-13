@@ -12,7 +12,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import argparse
-from typing import Dict
+from typing import Dict, List, Optional
+
+from src.data import CocoEvaluator
+from src.misc import MetricLogger
 
 # Import to register classes BEFORE loading config
 from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset, TemporalBatchCollateFunction
@@ -201,6 +204,208 @@ class Phase1Trainer:
             'train_non_key': train_non_key,
         }
     
+    @torch.no_grad()
+    def evaluate(self, val_dataloader: DataLoader, epoch: int) -> Dict[str, float]:
+        """
+        Evaluate model on validation set for both key and non-key paths
+        
+        IMPORTANT: Key and non-key frames are evaluated as PAIRS because:
+        - Non-key frame path uses cached CCFF features from its corresponding key frame
+        - Each pair (key_t, non_key_t+s) comes from the same video sequence
+        
+        Args:
+            val_dataloader: Validation dataloader (returns paired frames)
+            epoch: Current epoch number
+        
+        Returns:
+            metrics: Dict with mAP for key and non-key paths
+        """
+        from torchvision.ops import box_iou
+        
+        self.model.eval()
+        
+        # Collect predictions and ground truths
+        all_pred_boxes_key = []
+        all_pred_scores_key = []
+        all_pred_labels_key = []
+        all_gt_boxes_key = []
+        all_gt_labels_key = []
+        
+        all_pred_boxes_non_key = []
+        all_pred_scores_non_key = []
+        all_pred_labels_non_key = []
+        all_gt_boxes_non_key = []
+        all_gt_labels_non_key = []
+        
+        print(f"\n{'='*80}")
+        print(f"Evaluating Epoch {epoch + 1}...")
+        print(f"  Note: Evaluating key and non-key frames as PAIRS")
+        print(f"  Non-key frame uses cached CCFF from its paired key frame")
+        print(f"{'='*80}")
+        
+        for batch_idx, batch in enumerate(val_dataloader):
+            # Unpack batch - these are PAIRED frames from same video
+            if len(batch) == 4:
+                img_key, target_key, img_non_key, target_non_key = batch
+            else:
+                raise ValueError(f"Expected 4-tuple from dataloader, got {len(batch)}-tuple")
+            
+            # Move to device
+            img_key = img_key.to(self.device)
+            img_non_key = img_non_key.to(self.device)
+            target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                          for k, v in t.items()} for t in target_key]
+            target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                              for k, v in t.items()} for t in target_non_key]
+            
+            # Step 1: Forward key frame - this caches CCFF features
+            outputs_key, _, _ = self.model.forward_key_frame(img_key, None)
+            
+            # Step 2: Forward non-key frame - uses cached CCFF from step 1
+            outputs_non_key = self.model.forward_non_key_frame(img_non_key, None)
+            
+            # Process key frame predictions
+            if 'pred_boxes' in outputs_key and 'pred_logits' in outputs_key:
+                pred_boxes_key = outputs_key['pred_boxes']  # [B, num_queries, 4]
+                pred_logits_key = outputs_key['pred_logits']  # [B, num_queries, num_classes]
+                pred_scores_key = pred_logits_key.softmax(-1)[:, :, :-1].max(-1)[0]  # Max class score
+                pred_labels_key = pred_logits_key.softmax(-1)[:, :, :-1].argmax(-1)  # Class label
+                
+                # Store per-image predictions
+                for i in range(len(target_key)):
+                    # Filter predictions by score threshold
+                    score_threshold = 0.3
+                    keep = pred_scores_key[i] > score_threshold
+                    
+                    all_pred_boxes_key.append(pred_boxes_key[i][keep].cpu())
+                    all_pred_scores_key.append(pred_scores_key[i][keep].cpu())
+                    all_pred_labels_key.append(pred_labels_key[i][keep].cpu())
+                    all_gt_boxes_key.append(target_key[i]['boxes'].cpu())
+                    all_gt_labels_key.append(target_key[i]['labels'].cpu())
+            
+            # Process non-key frame predictions
+            if 'pred_boxes' in outputs_non_key and 'pred_logits' in outputs_non_key:
+                pred_boxes_non_key = outputs_non_key['pred_boxes']
+                pred_logits_non_key = outputs_non_key['pred_logits']
+                pred_scores_non_key = pred_logits_non_key.softmax(-1)[:, :, :-1].max(-1)[0]
+                pred_labels_non_key = pred_logits_non_key.softmax(-1)[:, :, :-1].argmax(-1)
+                
+                for i in range(len(target_non_key)):
+                    score_threshold = 0.3
+                    keep = pred_scores_non_key[i] > score_threshold
+                    
+                    all_pred_boxes_non_key.append(pred_boxes_non_key[i][keep].cpu())
+                    all_pred_scores_non_key.append(pred_scores_non_key[i][keep].cpu())
+                    all_pred_labels_non_key.append(pred_labels_non_key[i][keep].cpu())
+                    all_gt_boxes_non_key.append(target_non_key[i]['boxes'].cpu())
+                    all_gt_labels_non_key.append(target_non_key[i]['labels'].cpu())
+            
+            if batch_idx % 50 == 0:
+                print(f"  Evaluated {batch_idx}/{len(val_dataloader)} batches")
+        
+        # Compute mAP for key frame
+        print("\nComputing mAP for Key Frame Path...")
+        key_metrics = self._compute_map_simple(
+            all_pred_boxes_key, all_pred_scores_key, all_pred_labels_key,
+            all_gt_boxes_key, all_gt_labels_key
+        )
+        
+        # Compute mAP for non-key frame
+        print("Computing mAP for Non-Key Frame Path...")
+        non_key_metrics = self._compute_map_simple(
+            all_pred_boxes_non_key, all_pred_scores_non_key, all_pred_labels_non_key,
+            all_gt_boxes_non_key, all_gt_labels_non_key
+        )
+        
+        metrics = {
+            'mAP_key': key_metrics['mAP'],
+            'mAP50_key': key_metrics['mAP50'],
+            'mAP75_key': key_metrics['mAP75'],
+            'mAP_non_key': non_key_metrics['mAP'],
+            'mAP50_non_key': non_key_metrics['mAP50'],
+            'mAP75_non_key': non_key_metrics['mAP75'],
+        }
+        
+        print(f"\n{'='*80}")
+        print(f"Evaluation Results (Paired Evaluation):")
+        print(f"  Key Frame Path:")
+        print(f"    mAP:    {metrics['mAP_key']:.4f}")
+        print(f"    mAP50:  {metrics['mAP50_key']:.4f}")
+        print(f"    mAP75:  {metrics['mAP75_key']:.4f}")
+        print(f"  Non-Key Frame Path:")
+        print(f"    mAP:    {metrics['mAP_non_key']:.4f}")
+        print(f"    mAP50:  {metrics['mAP50_non_key']:.4f}")
+        print(f"    mAP75:  {metrics['mAP75_non_key']:.4f}")
+        print(f"  Performance Gap: {(metrics['mAP_key'] - metrics['mAP_non_key']):.4f}")
+        print(f"{'='*80}\n")
+        
+        self.model.train()
+        return metrics
+    
+    def _compute_map_simple(self, pred_boxes_list, pred_scores_list, pred_labels_list, 
+                           gt_boxes_list, gt_labels_list) -> Dict[str, float]:
+        """
+        Compute mAP using simple IoU matching
+        
+        Args:
+            pred_boxes_list: List of predicted boxes per image
+            pred_scores_list: List of prediction scores per image
+            pred_labels_list: List of prediction labels per image
+            gt_boxes_list: List of ground truth boxes per image
+            gt_labels_list: List of ground truth labels per image
+        
+        Returns:
+            metrics: Dict with mAP, mAP50, mAP75
+        """
+        from torchvision.ops import box_iou
+        
+        all_ious = []
+        all_scores = []
+        
+        for pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels in zip(
+            pred_boxes_list, pred_scores_list, pred_labels_list, gt_boxes_list, gt_labels_list
+        ):
+            if len(pred_boxes) == 0 or len(gt_boxes) == 0:
+                continue
+            
+            # Compute IoU between all predictions and ground truths
+            ious = box_iou(pred_boxes, gt_boxes)  # [num_preds, num_gts]
+            
+            # For each prediction, get the best matching GT
+            max_ious, max_indices = ious.max(dim=1)
+            
+            # Match labels
+            matched_labels = gt_labels[max_indices]
+            label_match = (pred_labels == matched_labels).float()
+            
+            # Only count IoU if labels match
+            max_ious = max_ious * label_match
+            
+            all_ious.extend(max_ious.tolist())
+            all_scores.extend(pred_scores.tolist())
+        
+        if len(all_ious) == 0:
+            return {'mAP': 0.0, 'mAP50': 0.0, 'mAP75': 0.0}
+        
+        # Convert to tensors and sort by score
+        all_ious = torch.tensor(all_ious)
+        all_scores = torch.tensor(all_scores)
+        
+        sorted_indices = torch.argsort(all_scores, descending=True)
+        sorted_ious = all_ious[sorted_indices]
+        
+        # Compute precision at different IoU thresholds
+        mAP50 = (sorted_ious > 0.5).float().mean().item()
+        mAP75 = (sorted_ious > 0.75).float().mean().item()
+        
+        # Compute mAP as average over IoU thresholds 0.5:0.05:0.95 (COCO style)
+        mAP = 0.0
+        for iou_thresh in torch.arange(0.5, 1.0, 0.05):
+            mAP += (sorted_ious > iou_thresh).float().mean().item()
+        mAP /= 10  # Average over 10 thresholds
+        
+        return {'mAP': mAP, 'mAP50': mAP50, 'mAP75': mAP75}
+    
     def save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
         """Save model checkpoint"""
         checkpoint = {
@@ -228,7 +433,6 @@ class Phase1Trainer:
                 torch.save(checkpoint, best_path)
                 print(f"✓ New best model saved!")
 
-
 def build_model_from_config(config_path: str, device: torch.device):
     """
     Build TemporalRTDETR model from config
@@ -245,8 +449,8 @@ def build_model_from_config(config_path: str, device: torch.device):
     if encoder is None or decoder is None:
         raise ValueError("Model must have encoder and decoder components")
     
-    # Get model config (default with 3, 256, 300)
-    num_decoder_layers = 3
+    # Get model config
+    num_decoder_layers = 6
     hidden_dim = 256
     num_queries = 300
     if 'RTDETRTransformerv2' in cfg.yaml_cfg:
@@ -260,15 +464,22 @@ def build_model_from_config(config_path: str, device: torch.device):
         hidden_dim = decoder_cfg.get('hidden_dim', 256)
         num_queries = decoder_cfg.get('num_queries', 300)
     
+    # Get Phase 1 specific parameters
+    use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
+    reuse_queries = cfg.yaml_cfg.get('reuse_queries', False)
+    non_key_decoder_layers = cfg.yaml_cfg.get('non_key_decoder_layers', 6)
+    
     # Create temporal model
     temporal_model = TemporalRTDETR(
         backbone=backbone,
         encoder=encoder,
         decoder=decoder,
         num_decoder_layers=num_decoder_layers,
-        non_key_decoder_layers=1,
+        non_key_decoder_layers=non_key_decoder_layers,
         hidden_dim=hidden_dim,
         num_queries=num_queries,
+        use_lightweight_decoder=use_lightweight_decoder,
+        reuse_queries=reuse_queries,
     )
     
     return temporal_model, cfg
@@ -443,6 +654,8 @@ def main():
             print(f"Error loading checkpoint: {e}")
             sys.exit(1)
     
+    val_dataloader = cfg.val_dataloader if hasattr(cfg, 'val_dataloader') else None
+    
     # Trainer
     trainer = Phase1Trainer(
         model=model,
@@ -471,13 +684,17 @@ def main():
         metrics = trainer.train_one_epoch(epoch)
         
         print(f"\n{'='*80}")
-        print(f"Epoch {epoch + 1} Summary:")
+        print(f"Epoch {epoch + 1} Training Summary:")
         print(f"  Total Loss:     {metrics['loss']:.4f}")
         if metrics['train_key']:
             print(f"  Key Frame:      {metrics['loss_key']:.4f}")
         if metrics['train_non_key']:
             print(f"  Non-Key Frame:  {metrics['loss_non_key']:.4f}")
         print(f"{'='*80}")
+        
+        if val_dataloader is not None:
+            eval_metrics = trainer.evaluate(val_dataloader, epoch)
+            metrics.update(eval_metrics)
         
         lr_scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
