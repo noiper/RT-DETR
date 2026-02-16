@@ -1,402 +1,311 @@
-"""
-Temporal RT-DETR Model for Phase 1 Training
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional
 import copy
+from typing import Dict, List, Tuple, Optional
+from ..rtdetr.rtdetrv2_decoder import RTDETRTransformerv2, TransformerDecoder
 
-
-class LightweightFusionBlock(nn.Module):
+class TemporalFusionBlock(nn.Module):
     """
-    Lightweight fusion block to combine:
-    - S5 features from non-key frame backbone
-    - Cached CCFF features from key frame encoder
-    
-    Projects S5 to match CCFF dimensions, then performs learnable weighted fusion
+    Fusion block for combining non-key frame features (S) with cached key frame features (CCFF)
     """
-    def __init__(self, s5_channels: int = 2048, hidden_dim: int = 256):
+    def __init__(self, s_channels: int, hidden_dim: int):
         super().__init__()
-        self.s5_channels = s5_channels
+        self.s_channels = s_channels
         self.hidden_dim = hidden_dim
         
-        # Project S5 to match CCFF dimensions
-        self.s5_proj = nn.Conv2d(s5_channels, hidden_dim, 1)
-        
-        # Learnable fusion weights
-        self.alpha = nn.Parameter(torch.ones(1))
-        self.beta = nn.Parameter(torch.ones(1))
-        
-        # Optional: Add a conv layer for feature refinement
-        self.refine = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+        # Project S features to hidden_dim
+        self.s_proj = nn.Sequential(
+            nn.Conv2d(s_channels, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True)
         )
-    
-    def forward(self, s5_features: torch.Tensor, ccff_features: torch.Tensor) -> torch.Tensor:
+        
+        # Fusion layer (combines projected S with CCFF)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_dim)
+        )
+        
+    def forward(self, s_feat: torch.Tensor, ccff_feat: torch.Tensor) -> torch.Tensor:
         """
+        Fuse S features with cached CCFF features
+        
         Args:
-            s5_features: S5 features from non-key frame backbone [B, C_s5, H, W]
-            ccff_features: Cached CCFF features from key frame encoder [B, C_hidden, H', W']
+            s_feat: Non-key frame feature [B, s_channels, H, W]
+            ccff_feat: Cached key frame feature [B, hidden_dim, H, W]
         
         Returns:
-            fused_features: Fused features [B, C_hidden, H', W']
+            fused_feat: Fused feature [B, hidden_dim, H, W]
         """
-        # Ensure both tensors are on the same device as s5_features
-        device = s5_features.device
-        ccff_features = ccff_features.to(device)
+        # Project S to hidden_dim
+        s_proj = self.s_proj(s_feat)  # [B, hidden_dim, H, W]
         
-        # Project S5 to hidden_dim
-        s5_features = self.s5_proj(s5_features)
+        # Concatenate and fuse
+        concat = torch.cat([s_proj, ccff_feat], dim=1)  # [B, hidden_dim*2, H, W]
+        fused = self.fusion(concat)  # [B, hidden_dim, H, W]
         
-        # Resize S5 to match CCFF spatial dimensions if needed
-        if s5_features.shape[-2:] != ccff_features.shape[-2:]:
-            s5_features = F.interpolate(
-                s5_features, 
-                size=ccff_features.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-        
-        # Weighted fusion
-        fused = self.alpha * s5_features + self.beta * ccff_features
-        
-        # Optional refinement
-        fused = self.refine(fused)
+        # Residual connection
+        fused = fused + ccff_feat
         
         return fused
 
-class SingleLayerDecoder(nn.Module):
+class LightweightDecoder(RTDETRTransformerv2):
     """
-    Lightweight 1-layer decoder for non-key frames
-    Just calls the full decoder but only uses the first layer's output
+    - REQUIRES query_emb and pos_emb from key frame
+    - No denoising
+    - No aux_loss
     """
-    def __init__(self, full_decoder: nn.Module, hidden_dim: int, num_queries: int):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_queries = num_queries
+    def __init__(self, full_decoder: RTDETRTransformerv2, num_layers: int = 1):
+        nn.Module.__init__(self)
         
-        # Store reference to full decoder - we'll use it but only take first layer output
-        self.full_decoder = full_decoder
+        # self.hidden_dim = full_decoder.hidden_dim       
+        self.num_levels = full_decoder.num_levels
+        # self.num_classes = full_decoder.num_classes
+        # self.num_queries = full_decoder.num_queries
+
+        # Copy decoder layers
+        self.num_decoder_layers = min(num_layers, full_decoder.decoder.num_layers)
+        self.decoder = TransformerDecoder(full_decoder.hidden_dim, full_decoder.decoder.layers[0], self.num_decoder_layers)
         
-        print(f"✓ Created SingleLayerDecoder:")
-        print(f"  - Wraps full decoder but only uses first layer output")
-        print(f"  - Decoder will run in eval mode to bypass denoising")
+        self.input_proj = copy.deepcopy(full_decoder.input_proj)
+        self.query_pos_head = copy.deepcopy(full_decoder.query_pos_head)
+        self.dec_score_head = nn.ModuleList([
+            copy.deepcopy(full_decoder.dec_score_head[i]) for i in range(num_layers)
+        ])
+        self.dec_bbox_head = nn.ModuleList([
+            copy.deepcopy(full_decoder.dec_bbox_head[i]) for i in range(num_layers)
+        ])
+        
+        self.eval_spatial_size = full_decoder.eval_spatial_size
     
-    def forward(self, memory, targets=None, query_embed=None):
+    def _get_encoder_input(self, feats: List[torch.Tensor]):
+        # get projection features
+        proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        if self.num_levels > len(proj_feats):
+            len_srcs = len(proj_feats)
+            for i in range(len_srcs, self.num_levels):
+                if i == len_srcs:
+                    proj_feats.append(self.input_proj[i](feats[-1]))
+                else:
+                    proj_feats.append(self.input_proj[i](proj_feats[-1]))
+
+        # get encoder inputs
+        feat_flatten = []
+        spatial_shapes = []
+        for i, feat in enumerate(proj_feats):
+            _, _, h, w = feat.shape
+            # [b, c, h, w] -> [b, h*w, c]
+            feat_flatten.append(feat.flatten(2).permute(0, 2, 1))
+            # [num_levels, 2]
+            spatial_shapes.append([h, w])
+        # [b, l, c]
+        feat_flatten = torch.concat(feat_flatten, 1)
+        return feat_flatten, spatial_shapes
+
+    def forward(self, feats, cached_content, cached_points_unact):
         """
-        Forward pass for lightweight decoder
-        Calls full decoder in eval mode (no denoising) and returns first layer predictions
+        Forward pass using cached query embeddings from key frame
         
         Args:
-            memory: List of multi-scale features [feat1, feat2, feat3]
-            targets: Ground truth (ignored - we run decoder in eval mode)
-            query_embed: Not used (full decoder generates its own queries)
+            feats: List of multi-scale features [feat1, feat2, feat3]
+            cached_content: Cached content from key frame [B, hidden_dim, H, W]
+            cached_points_unact: Cached reference points from key frame [B, num_queries, 4] (REQUIRED)
         
         Returns:
-            outputs: Dict with 'pred_logits' and 'pred_boxes' from first layer only
+            outputs: Dict with 'pred_logits' and 'pred_boxes' only
         """
-        # Set decoder to eval mode temporarily to bypass denoising
-        # Denoising is only used when training=True AND targets is not None
-        # But gradients will still flow through because we're not using no_grad()
-        was_training = self.full_decoder.training
-        self.full_decoder.eval()
+        # Get input proj
+        memory, spatial_shapes = self._get_encoder_input(feats)
         
-        # Call full decoder without targets (eval mode = no denoising)
-        # Gradients still flow through for training the decoder weights
-        outputs = self.full_decoder(memory, targets=None)
+        out_bboxes, out_logits = self.decoder(
+            cached_content,
+            cached_points_unact,
+            memory,
+            spatial_shapes,
+            self.dec_bbox_head,
+            self.dec_score_head,
+            self.query_pos_head,
+            attn_mask=None,
+        )
+        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+
+        # pred_logits = output['pred_logits']
+        # pred_boxes = output['pred_boxes']
         
-        # Restore training mode
-        if was_training:
-            self.full_decoder.train()
-        
-        # If outputs contains intermediate predictions, take only the first one
-        # Otherwise just return the final output (which would be from all layers)
-        if isinstance(outputs, dict):
-            # Check if there are auxiliary outputs (intermediate layer predictions)
-            if 'aux_outputs' in outputs and len(outputs['aux_outputs']) > 0:
-                # Use the first auxiliary output (first decoder layer)
-                first_layer_output = outputs['aux_outputs'][0]
-                return {
-                    'pred_logits': first_layer_output['pred_logits'],
-                    'pred_boxes': first_layer_output['pred_boxes'],
-                }
-            else:
-                # No auxiliary outputs, just use main output
-                # This means all layers were used, but we'll accept it
-                return {
-                    'pred_logits': outputs['pred_logits'],
-                    'pred_boxes': outputs['pred_boxes'],
-                }
-        else:
-            raise ValueError(f"Unexpected output format from decoder: {type(outputs)}")
+        return out
 
 class TemporalRTDETR(nn.Module):
     """
-    Temporal RT-DETR for Phase 1 Training
-    
-    Architecture:
-    - Key frame: Full path (Backbone -> Encoder -> Decoder)
-    - Non-key frame: Lightweight path (Backbone S5 -> Fusion with cached CCFF -> Decoder)
-    
-    The non-key frame path:
-    1. Uses only S5 from backbone (no encoder)
-    2. Fuses S5 with cached CCFF from key frame via LightweightFusionBlock
-    3. Uses either 1-layer decoder (lightweight) or full 6-layer decoder
-    4. Can optionally reuse object queries from key frame
+    Temporal RT-DETR for Phase 1 training
+    - Key frame: Backbone + Encoder + Decoder
+    - Non-key frame: Backbone + Fusion + Lightweight Decoder
     """
-    
     def __init__(
         self,
         backbone: nn.Module,
         encoder: nn.Module,
         decoder: nn.Module,
-        num_decoder_layers: int = 6,
-        non_key_decoder_layers: int = 6,
+        num_classes: int = 80,
         hidden_dim: int = 256,
         num_queries: int = 300,
-        use_lightweight_decoder: bool = False,
-        reuse_queries: bool = False,
+        use_lightweight_decoder: bool = True,
+        reuse_queries: bool = True,
     ):
-        """
-        Args:
-            num_decoder_layers: Number of decoder layers for key frames
-            non_key_decoder_layers: Number of decoder layers for non-key frames
-            hidden_dim: Hidden dimension
-            num_queries: Number of object queries
-            use_lightweight_decoder: If True, use only 1 decoder layer for non-key frames (overrides non_key_decoder_layers)
-            reuse_queries: If True, reuse queries from key frame for non-key frame
-        """
         super().__init__()
         
         self.backbone = backbone
         self.encoder = encoder
         self.decoder = decoder
-        
-        self.num_decoder_layers = num_decoder_layers
-        self.non_key_decoder_layers = non_key_decoder_layers
+        self.num_classes = num_classes
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
         self.use_lightweight_decoder = use_lightweight_decoder
         self.reuse_queries = reuse_queries
         
-        # Fusion block for non-key frame (will be created dynamically)
-        self.fusion_block = None
-        self._s5_channels = None
-        
+        # Cached features from key frame
+        self.cached_ccff = None
+        self.cached_content = None
+        self.cached_points_unact = None
+
+        device = next(decoder.parameters()).device
+
+        self.fusion_blocks = nn.ModuleList([
+            TemporalFusionBlock(s_channels=128, hidden_dim=hidden_dim).to(device),  # S3 + CCFF1
+            TemporalFusionBlock(s_channels=256, hidden_dim=hidden_dim).to(device),  # S4 + CCFF2
+            TemporalFusionBlock(s_channels=512, hidden_dim=hidden_dim).to(device),  # S5 + CCFF3
+        ])
+
         # Create lightweight decoder if needed
         if use_lightweight_decoder:
-            self.lightweight_decoder = SingleLayerDecoder(
+            self.lightweight_decoder = LightweightDecoder(
                 full_decoder=decoder,
-                hidden_dim=hidden_dim,
-                num_queries=num_queries
+                num_layers=1
             )
         else:
             self.lightweight_decoder = None
         
-        # Cache for key frame outputs
-        self.cached_ccff_features = None
-        self.cached_query_embeds = None  # Cache query embeddings
-        self.cached_memory = None  # Cache decoder memory/hidden states
-        
-        print(f"TemporalRTDETR initialized:")
-        print(f"  Key frame: Full path (Backbone -> Encoder -> {num_decoder_layers}-layer Decoder)")
-        print(f"  Non-key frame: Lightweight path (Backbone S5 -> Fusion -> {'1-layer' if use_lightweight_decoder else str(non_key_decoder_layers) + '-layer'} Decoder)")
-        print(f"  Reuse queries: {reuse_queries}")
-        print(f"  Fusion block will be created dynamically on first forward pass")
+        print(f"  Success!")
+        print(f"  - Use lightweight decoder: {use_lightweight_decoder}")
+        print(f"  - Reuse queries: {reuse_queries}")
     
-    def _extract_decoder_queries(self, decoder_output: Dict) -> Optional[torch.Tensor]:
+    def forward_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Tuple:
         """
-        Extract query embeddings from decoder output for reuse.
-        
-        The exact extraction depends on the decoder implementation.
-        Typically, decoders store intermediate query embeddings.
+        Forward key frame through full pipeline and cache features
         
         Args:
-            decoder_output: Output from decoder forward pass
+            img: Key frame image [B, C, H, W]
+            targets: Ground truth annotations
         
         Returns:
-            query_embeds: Query embeddings [num_queries, B, hidden_dim] or None
+            outputs: Detection outputs
+            ccff_features: Cached multi-scale features
+            query_embeddings: Cached query embeddings (optional)
         """
-        if not self.reuse_queries:
-            return None
+        backbone_features = self.backbone(img)
+        c3, c4, c5 = backbone_features[-3:]
+        encoder_output = self.encoder([c3, c4, c5])
+        self.cached_ccff = [feat.detach() for feat in encoder_output]
+        outputs, cached_query = self.decoder(encoder_output, return_query=True, targets=targets)
         
-        # Try to extract queries from decoder output
-        # This depends on your decoder implementation
-        
-        # Common cases:
-        # 1. Output is a dict with 'query' or 'query_embed' key
-        if isinstance(decoder_output, dict):
-            if 'query' in decoder_output:
-                return decoder_output['query'].detach()
-            if 'query_embed' in decoder_output:
-                return decoder_output['query_embed'].detach()
-            if 'hidden_states' in decoder_output:
-                # Last hidden state might be the query
-                hidden = decoder_output['hidden_states']
-                if isinstance(hidden, (list, tuple)):
-                    return hidden[-1].detach()
-                return hidden.detach()
-        
-        # 2. Check if decoder has stored queries as attribute
-        if hasattr(self.decoder, 'query_embed'):
-            return self.decoder.query_embed.detach()
-        
-        # 3. Check if decoder has a method to get queries
-        if hasattr(self.decoder, 'get_queries'):
-            return self.decoder.get_queries().detach()
-        
-        # Could not extract queries
-        return None
-    
-    def forward_key_frame(
-        self, 
-        images: torch.Tensor,
-        targets: Optional[List[Dict]] = None
-    ) -> Tuple[Dict, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for key frame (f_t)
-        Full RT-DETR path: Backbone -> Encoder -> Decoder
-        
-        Args:
-            images: Input images [B, 3, H, W]
-            targets: Ground truth targets (list of dicts)
-        
-        Returns:
-            outputs: Decoder outputs (logits, boxes)
-            ccff_features: Cross-scale concatenated features from encoder
-            decoder_queries: Object queries from decoder (or None)
-        """
-        # Extract multi-scale features
-        features = self.backbone(images)
-        
-        # Encode features (Intra-scale + Cross-scale fusion)
-        # Returns CCFF features (Cross-scale Concatenated Features)
-        ccff_features = self.encoder(features)
-        
-        # Decode with full decoder layers
-        outputs = self.decoder(ccff_features, targets=targets)
-        
-        # Cache CCFF features for non-key frame (keep on same device)
-        if isinstance(ccff_features, (list, tuple)):
-            self.cached_ccff_features = [f.detach().clone() for f in ccff_features]
-        else:
-            self.cached_ccff_features = ccff_features.detach().clone()
-        
-        # Extract and cache decoder queries if needed
         if self.reuse_queries:
-            self.cached_query_embeds = self._extract_decoder_queries(outputs)
-            if self.cached_query_embeds is not None:
-                print(f"Cached query embeddings: {self.cached_query_embeds.shape}")
-        else:
-            self.cached_query_embeds = None
+            # self.cached_queries = outputs['query_embed'].detach()
+            self.cached_content = cached_query[0][:, :self.num_queries, :].detach()
+            self.cached_points_unact = cached_query[1][:, :self.num_queries, :].detach()
         
-        return outputs, ccff_features, self.cached_query_embeds
+        return outputs
     
-    def forward_non_key_frame(
-        self, 
-        images: torch.Tensor,
-        targets: Optional[List[Dict]] = None
-    ) -> Dict:
+    def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict:
         """
-        Forward pass for non-key frame (f_{t+s})
-        Lightweight path: Backbone S5 -> Fusion with cached CCFF -> Decoder
+        Forward non-key frame through lightweight pipeline with fusion
         
         Args:
-            images: Input images [B, 3, H, W]
-            targets: Ground truth targets (list of dicts)
+            img: Non-key frame image [B, C, H, W]
+            targets: Ground truth annotations
         
         Returns:
-            outputs: Decoder outputs (logits, boxes)
+            outputs: Detection outputs
         """
-        # Extract multi-scale features from non-key frame
-        features = self.backbone(images)
+        if self.cached_ccff is None:
+            raise RuntimeError("Key frame must be processed first to cache CCFF features")
         
-        # Get S5 (last feature map from backbone)
-        # Assuming features is a list [S3, S4, S5] or dict
-        if isinstance(features, (list, tuple)):
-            s5_features = features[-1]  # Last feature map
-        elif isinstance(features, dict):
-            # Get the highest level feature
-            s5_features = features[max(features.keys())]
-        else:
-            s5_features = features
+        # Extract multi-scale features from backbone
+        backbone_features = self.backbone(img)
         
-        # Create fusion block on first use (now we know S5 channels)
-        if self.fusion_block is None:
-            self._s5_channels = s5_features.shape[1]
-            self.fusion_block = LightweightFusionBlock(
-                s5_channels=self._s5_channels, 
-                hidden_dim=self.hidden_dim
-            ).to(s5_features.device)
-            print(f"Created fusion block: S5 channels={self._s5_channels}, hidden_dim={self.hidden_dim}")
+        # Get last 3 scales: S3, S4, S5
+        s3, s4, s5 = backbone_features[-3:]
+        s_features = [s3, s4, s5]
         
-        # Fuse S5 with cached CCFF from key frame
-        if self.cached_ccff_features is None:
-            raise RuntimeError("Must call forward_key_frame before forward_non_key_frame")
+        # Fuse each scale with cached CCFF
+        fused_features = []
+        for _, (s_feat, ccff_feat, fusion_block) in enumerate(zip(s_features, self.cached_ccff, self.fusion_blocks)):
+            fused = fusion_block(s_feat, ccff_feat)
+            fused_features.append(fused)
         
-        # CCFF is usually a tensor or list of tensors
-        # Assume it's the concatenated multi-scale features
-        if isinstance(self.cached_ccff_features, (list, tuple)):
-            ccff_for_fusion = self.cached_ccff_features[-1]
-        else:
-            ccff_for_fusion = self.cached_ccff_features
+        # Prepare decoder input (fused multi-scale features)
+        decoder_input = fused_features
         
-        # Fuse features
-        fused_features = self.fusion_block(s5_features, ccff_for_fusion)
-        
-        # Prepare input for decoder
-        # The decoder expects the same format as encoder output
-        if isinstance(self.cached_ccff_features, (list, tuple)):
-            # Replace the last feature with fused features
-            decoder_input = list(self.cached_ccff_features)
-            decoder_input[-1] = fused_features
-        else:
-            decoder_input = fused_features
-        
-        # Prepare query embeddings if reusing
-        query_embed = None
-        if self.reuse_queries and self.cached_query_embeds is not None:
-            query_embed = self.cached_query_embeds
+        # Get cached query embeddings if available
+        # query_embed = self.cached_content if self.reuse_queries else None
         
         # Use lightweight or full decoder
         if self.use_lightweight_decoder and self.lightweight_decoder is not None:
-            # Use single-layer decoder
-            outputs = self.lightweight_decoder(decoder_input, targets=targets, query_embed=query_embed)
+            # Use single-layer decoder (trainable)
+            # Call with only positional argument (memory)
+            outputs = self.lightweight_decoder(decoder_input, self.cached_content, self.cached_points_unact)
         else:
             # Use full decoder
-            # Note: Not all decoders support query_embed parameter, so we skip it for now
             outputs = self.decoder(decoder_input, targets=targets)
         
         return outputs
     
-    def forward(
-        self, 
-        images_key: torch.Tensor,
-        images_non_key: torch.Tensor,
-        targets_key: Optional[List[Dict]] = None,
-        targets_non_key: Optional[List[Dict]] = None,
-    ) -> Tuple[Dict, Dict]:
+    def forward(self, key_frame: torch.Tensor, non_key_frame: torch.Tensor, 
+                key_targets: Optional[List[Dict]] = None, 
+                non_key_targets: Optional[List[Dict]] = None) -> Tuple[Dict, Dict]:
         """
-        Full forward pass for training
+        Forward both key and non-key frames
         
         Args:
-            images_key: Key frame images [B, 3, H, W]
-            images_non_key: Non-key frame images [B, 3, H, W]
-            targets_key: Key frame targets
-            targets_non_key: Non-key frame targets
+            key_frame: Key frame image
+            non_key_frame: Non-key frame image
+            key_targets: Key frame targets
+            non_key_targets: Non-key frame targets
         
         Returns:
-            outputs_key: Key frame predictions
-            outputs_non_key: Non-key frame predictions
+            key_outputs, non_key_outputs
         """
-        # Forward key frame
-        outputs_key, _, _ = self.forward_key_frame(images_key, targets_key)
+        # Process key frame
+        key_outputs = self.forward_key_frame(key_frame, key_targets)
         
-        # Forward non-key frame (uses cached CCFF from key frame)
-        outputs_non_key = self.forward_non_key_frame(images_non_key, targets_non_key)
+        # Process non-key frame
+        non_key_outputs = self.forward_non_key_frame(non_key_frame, non_key_targets)
         
-        return outputs_key, outputs_non_key
+        return key_outputs, non_key_outputs
+
+
+def build_temporal_rtdetr(cfg):
+    """Build Temporal RT-DETR model from config"""
+    # Import backbone, encoder, decoder builders
+    from ..rtdetr import build_backbone, build_encoder, build_decoder
+    
+    # Build components
+    backbone = build_backbone(cfg)
+    encoder = build_encoder(cfg)
+    decoder = build_decoder(cfg)
+    
+    # Build temporal model
+    model = TemporalRTDETR(
+        backbone=backbone,
+        encoder=encoder,
+        decoder=decoder,
+        num_classes=cfg.num_classes,
+        hidden_dim=cfg.hidden_dim,
+        num_queries=cfg.num_queries,
+        use_lightweight_decoder=cfg.get('use_lightweight_decoder', True),
+        reuse_queries=cfg.get('reuse_queries', True),
+    )
+    
+    return model

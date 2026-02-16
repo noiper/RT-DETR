@@ -551,7 +551,7 @@ class RTDETRTransformerv2(nn.Module):
         return topk_memory, topk_logits, topk_coords
 
 
-    def forward(self, feats, targets=None):
+    def forward(self, feats, return_query = False, targets=None):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
         
@@ -570,6 +570,10 @@ class RTDETRTransformerv2(nn.Module):
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+
+        cached_query = None
+        if return_query:
+            cached_query = init_ref_contents, init_ref_points_unact
 
         # decoder
         out_bboxes, out_logits = self.decoder(
@@ -597,6 +601,8 @@ class RTDETRTransformerv2(nn.Module):
                 out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
                 out['dn_meta'] = dn_meta
 
+        if return_query:
+            return out, cached_query
         return out
 
 

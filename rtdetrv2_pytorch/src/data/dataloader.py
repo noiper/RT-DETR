@@ -21,6 +21,7 @@ __all__ = [
     'DataLoader',
     'BaseCollateFunction', 
     'BatchImageCollateFuncion',
+    'TemporalBatchCollateFunction',
     'batch_image_collate_fn'
 ]
 
@@ -105,3 +106,28 @@ class BatchImageCollateFuncion(BaseCollateFunction):
 
         return images, targets
 
+@register()
+class TemporalBatchCollateFunction(BaseCollateFunction):
+    """4-tuple collate function"""
+    def __init__(
+        self, 
+        scales=None, 
+        stop_epoch=None, 
+    ) -> None:
+        super().__init__()
+        self.scales = scales
+        self.stop_epoch = stop_epoch if stop_epoch is not None else 100000000
+    
+    def __call__(self, items):
+        images_key = torch.cat([x[0][None] for x in items], dim=0)
+        targets_key = [x[1] for x in items]
+        images_non_key = torch.cat([x[2][None] for x in items], dim=0)
+        targets_non_key = [x[3] for x in items]
+        
+        # Optional: Apply multi-scale training
+        if self.scales is not None and self.epoch < self.stop_epoch:
+            sz = random.choice(self.scales)
+            images_key = F.interpolate(images_key, size=sz)
+            images_non_key = F.interpolate(images_non_key, size=sz)
+        
+        return images_key, targets_key, images_non_key, targets_non_key

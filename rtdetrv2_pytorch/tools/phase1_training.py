@@ -18,7 +18,7 @@ from src.data import CocoEvaluator
 from src.misc import MetricLogger
 
 # Import to register classes BEFORE loading config
-from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset, TemporalBatchCollateFunction
+from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset
 from src.core import YAMLConfig
 
 class Phase1Trainer:
@@ -59,10 +59,8 @@ class Phase1Trainer:
         if training_strategy == 'alternate':
             print(f"  Alternate interval: {alternate_interval} epoch(s)")
             print(f"  Note: Backbone/Encoder/Fusion shared, only decoder alternates")
-        elif self.training_strategy == 'freeze_key':
-            print(f"  Training mode: Non-key frame only (Fusion + Lightweight decoder)")
-            
-            # Freeze the key-frame path
+        elif training_strategy == 'freeze_key':
+            # Freeze key frame path
             for param in self.model.backbone.parameters():
                 param.requires_grad = False
             for param in self.model.encoder.parameters():
@@ -70,14 +68,16 @@ class Phase1Trainer:
             for param in self.model.decoder.parameters():
                 param.requires_grad = False
             
-            # Make sure lightweight decoder and fusion block (if exists) are trainable
+            # Ensure fusion block and lightweight decoder are trainable
+            for _, fusion_block in enumerate(self.model.fusion_blocks):
+                for param in fusion_block.parameters():
+                    param.requires_grad = True
+            
+            # Ensure lightweight decoder is trainable (if it exists)
             if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
                 for param in self.model.lightweight_decoder.parameters():
                     param.requires_grad = True
-            if hasattr(self.model, 'fusion_block') and self.model.fusion_block is not None:
-                for param in self.model.fusion_block.parameters():
-                    param.requires_grad = True
-
+    
         elif training_strategy == 'joint':
             print(f"  Training both key and non-key paths jointly")
         else:
@@ -96,7 +96,6 @@ class Phase1Trainer:
         
         # Determine training mode for this epoch
         if self.training_strategy == 'alternate':
-            # Alternate between key and non-key frame training
             epoch_cycle = epoch // self.alternate_interval
             train_key = (epoch_cycle % 2 == 0)
             train_non_key = not train_key
@@ -111,12 +110,6 @@ class Phase1Trainer:
         elif self.training_strategy == 'freeze_key':
             train_key = False
             train_non_key = True
-            # Freeze only the main decoder (3-layer), keep lightweight decoder trainable
-            for param in self.model.decoder.parameters():
-                param.requires_grad = False
-            if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
-                for param in self.model.lightweight_decoder.parameters():
-                    param.requires_grad = True
             
         elif self.training_strategy == 'joint':
             # Train both paths together
@@ -132,13 +125,7 @@ class Phase1Trainer:
         total_loss_non_key = 0.0
         
         for batch_idx, batch in enumerate(self.dataloader):
-            # Unpack batch
-            if len(batch) == 4:
-                img_key, target_key, img_non_key, target_non_key = batch
-            else:
-                raise ValueError(f"Expected 4-tuple from dataloader, got {len(batch)}-tuple")
-            
-            # Move to device
+            img_key, target_key, img_non_key, target_non_key = batch
             img_key = img_key.to(self.device)
             img_non_key = img_non_key.to(self.device)
             target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
@@ -148,12 +135,10 @@ class Phase1Trainer:
             
             self.optimizer.zero_grad()
             
-            # Initialize losses
             loss = None
             loss_key_value = 0.0
             loss_non_key_value = 0.0
             
-            # Forward key frame
             if train_key:
                 outputs_key, _, _ = self.model.forward_key_frame(img_key, target_key)
                 loss_dict_key = self.criterion(outputs_key, target_key)
@@ -161,15 +146,10 @@ class Phase1Trainer:
                 loss = loss_key
                 loss_key_value = loss_key.item()
             
-            # Forward non-key frame
             if train_non_key:
-                # IMPORTANT: If we're not training key frame, we still need to forward it
-                # to cache CCFF features, but without computing gradients
                 if not train_key:
                     with torch.no_grad():
-                        # Forward key frame just to cache CCFF
-                        # Pass targets to avoid denoising issues
-                        _, _, _ = self.model.forward_key_frame(img_key, target_key)
+                        self.model.forward_key_frame(img_key, target_key)
                 
                 outputs_non_key = self.model.forward_non_key_frame(img_non_key, target_non_key)
                 loss_dict_non_key = self.criterion(outputs_non_key, target_non_key)
@@ -181,17 +161,13 @@ class Phase1Trainer:
                 else:
                     loss = loss + self.lambda_non_key * loss_non_key
             
-            # Backward and optimize
             if loss is not None:
                 loss.backward()
-                
-                # Gradient clipping
                 if self.clip_max_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in self.model.parameters() if p.requires_grad], 
                         max_norm=self.clip_max_norm
                     )
-                
                 self.optimizer.step()
             
             # Accumulate losses
@@ -280,7 +256,7 @@ class Phase1Trainer:
                               for k, v in t.items()} for t in target_non_key]
             
             # Step 1: Forward key frame - this caches CCFF features
-            outputs_key, _, _ = self.model.forward_key_frame(img_key, None)
+            outputs_key, _, _, _ = self.model.forward_key_frame(img_key, None)
             
             # Step 2: Forward non-key frame - uses cached CCFF from step 1
             outputs_non_key = self.model.forward_non_key_frame(img_non_key, None)
@@ -458,7 +434,7 @@ def build_model_from_config(config_path: str, device: torch.device):
     """
     Build TemporalRTDETR model from config
     """
-    # Load config
+    print(f"\nBuilding model from: {config_path}")
     cfg = YAMLConfig(config_path)
     base_model = cfg.model.to(device)
     
@@ -471,32 +447,27 @@ def build_model_from_config(config_path: str, device: torch.device):
         raise ValueError("Model must have encoder and decoder components")
     
     # Get model config
-    num_decoder_layers = 3
     hidden_dim = 256
     num_queries = 300
     if 'RTDETRTransformerv2' in cfg.yaml_cfg:
         decoder_cfg = cfg.yaml_cfg['RTDETRTransformerv2']
-        num_decoder_layers = decoder_cfg.get('num_layers', 3)
         hidden_dim = decoder_cfg.get('hidden_dim', 256)
         num_queries = decoder_cfg.get('num_queries', 300)
     elif 'RTDETRTransformer' in cfg.yaml_cfg:
         decoder_cfg = cfg.yaml_cfg['RTDETRTransformer']
-        num_decoder_layers = decoder_cfg.get('num_decoder_layers', decoder_cfg.get('num_layers', 3))
         hidden_dim = decoder_cfg.get('hidden_dim', 256)
         num_queries = decoder_cfg.get('num_queries', 300)
     
     # Get Phase 1 specific parameters
     use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
     reuse_queries = cfg.yaml_cfg.get('reuse_queries', False)
-    non_key_decoder_layers = cfg.yaml_cfg.get('non_key_decoder_layers', 3)
     
     # Create temporal model
     temporal_model = TemporalRTDETR(
         backbone=backbone,
         encoder=encoder,
         decoder=decoder,
-        num_decoder_layers=num_decoder_layers,
-        non_key_decoder_layers=non_key_decoder_layers,
+        num_classes=cfg.yaml_cfg.get('num_classes', 80),
         hidden_dim=hidden_dim,
         num_queries=num_queries,
         use_lightweight_decoder=use_lightweight_decoder,
@@ -507,19 +478,13 @@ def build_model_from_config(config_path: str, device: torch.device):
 
 
 def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, device: torch.device):
-    """Load pretrained weights for key frame path"""
+    """
+    Load pretrained weights for key frame path
+    """
     print(f"\nLoading pretrained key frame path from: {pretrained_path}")
     
     checkpoint = torch.load(pretrained_path, map_location=device)
-    
-    # Handle different checkpoint formats
-    if 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    elif 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-
+    state_dict = checkpoint['model']
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
     if missing_keys:
@@ -586,7 +551,6 @@ def main():
     print(f"Device: {device}")
      
     # Load config and build model
-    print("Loading configuration and building model...")
     try:
         model, cfg = build_model_from_config(args.config, device)
 
@@ -617,7 +581,6 @@ def main():
         if args.debug:
             print(f"  Debug mode:      {args.debug_batches} batches/epoch")
         
-        # Set random seed
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
@@ -629,16 +592,14 @@ def main():
         sys.exit(1)
     
     # Get DataLoader from config
-    print(f"\nLoading dataset from config...")
+    print(f"\nLoading dataset from config")
     try:
         train_dataloader = cfg.train_dataloader
-        
-        # Wrap in debug subset if needed
         if args.debug:
             train_dataloader = DebugSubsetDataLoader(train_dataloader, args.debug_batches)
-            print(f"DataLoader loaded (DEBUG MODE - {args.debug_batches} batches)")
+            print(f"  DataLoader loaded (DEBUG MODE - {args.debug_batches} batches)")
         else:
-            print(f"DataLoader loaded from config")
+            print(f"  DataLoader loaded")
         
         print(f"  Dataset: {train_dataloader.dataset.__class__.__name__}")
         print(f"  Collate function: {train_dataloader.collate_fn.__class__.__name__}")

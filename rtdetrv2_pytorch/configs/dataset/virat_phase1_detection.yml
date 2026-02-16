@@ -7,9 +7,6 @@ evaluator:
 num_classes: 5
 remap_mscoco_category: False
 
-# Phase 1 temporal training specific
-max_frame_gap: 10
-
 train_dataloader: 
   type: DataLoader
   dataset: 
@@ -17,25 +14,32 @@ train_dataloader:
     root_dir: ../dataset/VIRAT/train_videos/
     ann_file: ../dataset/VIRAT/train.json
     max_frame_gap: 10
-    return_pair: True
-    return_masks: False
-    # Pair sampling strategies:
-    # - "all": All possible gaps (most pairs, slowest) ~339k pairs
-    # - "random_single": One random gap per frame (balanced) ~34k pairs
-    # - "fixed_gap": Only max_frame_gap (specific gap) ~31k pairs
-    # - "stride": Key frames every N frames, fixed gap (smallest) ~6.2k pairs (stride=5)
-    # - "stride_random": Key frames every N frames, random gap (efficient + diverse) ~6.2k pairs (stride=5)
-    pair_sampling_strategy: "random_single"  # Change this to experiment
-    frame_stride: 5  # Only used for "stride" and "stride_random" strategies
+    pair_sampling_strategy: "random_single"
+    frame_stride: 5
     transforms:
       type: Compose
-      ops: ~
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}   
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      # policy:
+      #   name: stop_epoch
+      #   epoch: 71
+      #   ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
   shuffle: True
   num_workers: 4
   drop_last: True
   batch_size: 4
   collate_fn:
     type: TemporalBatchCollateFunction
+    scales: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
+    stop_epoch: 71
 
 
 val_dataloader:
@@ -45,13 +49,13 @@ val_dataloader:
     root_dir: ../dataset/VIRAT/val_videos/
     ann_file: ../dataset/VIRAT/val.json
     max_frame_gap: 10
-    return_pair: False
-    return_masks: False
-    pair_sampling_strategy: "fixed_gap"  # Use fixed gap for validation
+    pair_sampling_strategy: "fixed_gap"
     frame_stride: 1
     transforms:
       type: Compose
-      ops: ~ 
+      ops: 
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}   
   shuffle: False
   num_workers: 4
   drop_last: False
