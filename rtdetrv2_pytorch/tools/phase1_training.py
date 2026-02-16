@@ -17,6 +17,8 @@ from typing import Dict, List, Optional
 from src.data import CocoEvaluator
 from src.misc import MetricLogger
 
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
 # Import to register classes BEFORE loading config
 from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset
 from src.core import YAMLConfig
@@ -140,12 +142,12 @@ class Phase1Trainer:
             loss_non_key_value = 0.0
             
             if train_key:
-                outputs_key, _, _ = self.model.forward_key_frame(img_key, target_key)
+                outputs_key = self.model.forward_key_frame(img_key, target_key)
                 loss_dict_key = self.criterion(outputs_key, target_key)
                 loss_key = sum(loss_dict_key.values())
                 loss = loss_key
                 loss_key_value = loss_key.item()
-            
+
             if train_non_key:
                 if not train_key:
                     with torch.no_grad():
@@ -241,12 +243,8 @@ class Phase1Trainer:
         print(f"{'='*80}")
         
         for batch_idx, batch in enumerate(val_dataloader):
-            # Unpack batch - these are PAIRED frames from same video
-            if len(batch) == 4:
-                img_key, target_key, img_non_key, target_non_key = batch
-            else:
-                raise ValueError(f"Expected 4-tuple from dataloader, got {len(batch)}-tuple")
-            
+            img_key, target_key, img_non_key, target_non_key = batch
+  
             # Move to device
             img_key = img_key.to(self.device)
             img_non_key = img_non_key.to(self.device)
@@ -255,13 +253,9 @@ class Phase1Trainer:
             target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                               for k, v in t.items()} for t in target_non_key]
             
-            # Step 1: Forward key frame - this caches CCFF features
-            outputs_key, _, _, _ = self.model.forward_key_frame(img_key, None)
-            
-            # Step 2: Forward non-key frame - uses cached CCFF from step 1
+            outputs_key = self.model.forward_key_frame(img_key, None)
             outputs_non_key = self.model.forward_non_key_frame(img_non_key, None)
             
-            # Process key frame predictions
             if 'pred_boxes' in outputs_key and 'pred_logits' in outputs_key:
                 pred_boxes_key = outputs_key['pred_boxes']  # [B, num_queries, 4]
                 pred_logits_key = outputs_key['pred_logits']  # [B, num_queries, num_classes]
@@ -270,7 +264,6 @@ class Phase1Trainer:
                 
                 # Store per-image predictions
                 for i in range(len(target_key)):
-                    # Filter predictions by score threshold
                     score_threshold = 0.3
                     keep = pred_scores_key[i] > score_threshold
                     
@@ -630,6 +623,8 @@ def main():
             sys.exit(1)
     
     val_dataloader = cfg.val_dataloader if hasattr(cfg, 'val_dataloader') else None
+    if args.debug:
+            val_dataloader = DebugSubsetDataLoader(val_dataloader, args.debug_batches)
     
     # Trainer
     trainer = Phase1Trainer(

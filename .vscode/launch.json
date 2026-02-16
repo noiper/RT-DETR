@@ -1,0 +1,60 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Phase 1 Training (CPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase1_training.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
+                "--debug",
+                "--pretrained",
+                "best.pth",
+                "--training_strategy",
+                "freeze_key"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
+                "CUDA_VISIBLE_DEVICES": "" 
+            }
+        },
+        {
+            "name": "Python: RT-DETR Train (CPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
+                "CUDA_VISIBLE_DEVICES": "" 
+            }
+        },
+        {
+            "name": "Python: RT-DETR Train (GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
+            }
+        }
+    ]
+}
