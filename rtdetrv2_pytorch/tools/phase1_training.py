@@ -5,6 +5,8 @@ Run with: python rtdetrv2_pytorch/tools/phase1_training.py -c rtdetrv2_pytorch/c
 
 import os 
 import sys
+
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from pathlib import Path
@@ -16,8 +18,10 @@ from typing import Dict, List, Optional
 
 from src.data import CocoEvaluator
 from src.misc import MetricLogger
+from src.core._config import BaseConfig
 
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
 
 # Import to register classes BEFORE loading config
 from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset
@@ -36,6 +40,8 @@ class Phase1Trainer:
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
         dataloader: DataLoader,
+        postprocessor: nn.Module,
+        cfg: BaseConfig,
         device: torch.device,
         lambda_non_key: float = 0.5,
         output_dir: str = 'output',
@@ -48,6 +54,8 @@ class Phase1Trainer:
         self.criterion = criterion
         self.optimizer = optimizer
         self.dataloader = dataloader
+        self.postprocessor = postprocessor
+        self.cfg = cfg
         self.device = device
         self.lambda_non_key = lambda_non_key
         self.output_dir = Path(output_dir)
@@ -206,195 +214,211 @@ class Phase1Trainer:
     @torch.no_grad()
     def evaluate(self, val_dataloader: DataLoader, epoch: int) -> Dict[str, float]:
         """
-        Evaluate model on validation set for both key and non-key paths
-        
-        IMPORTANT: Key and non-key frames are evaluated as PAIRS because:
-        - Non-key frame path uses cached CCFF features from its corresponding key frame
-        - Each pair (key_t, non_key_t+s) comes from the same video sequence
-        
-        Args:
-            val_dataloader: Validation dataloader (returns paired frames)
-            epoch: Current epoch number
-        
-        Returns:
-            metrics: Dict with mAP for key and non-key paths
+        Evaluate model on validation set
+        Computes mAP for both key and non-key frames using simple implementation
         """
         from torchvision.ops import box_iou
         
         self.model.eval()
-        
-        # Collect predictions and ground truths
-        all_pred_boxes_key = []
-        all_pred_scores_key = []
-        all_pred_labels_key = []
-        all_gt_boxes_key = []
-        all_gt_labels_key = []
-        
-        all_pred_boxes_non_key = []
-        all_pred_scores_non_key = []
-        all_pred_labels_non_key = []
-        all_gt_boxes_non_key = []
-        all_gt_labels_non_key = []
+        if self.criterion is not None:
+            self.criterion.eval()
         
         print(f"\n{'='*80}")
-        print(f"Evaluating Epoch {epoch + 1}...")
-        print(f"  Note: Evaluating key and non-key frames as PAIRS")
-        print(f"  Non-key frame uses cached CCFF from its paired key frame")
+        print(f"Evaluating Epoch {epoch}...")
+        print(f"  Evaluating BOTH key and non-key frames")
         print(f"{'='*80}")
         
-        for batch_idx, batch in enumerate(val_dataloader):
-            img_key, target_key, img_non_key, target_non_key = batch
-  
-            # Move to device
+        # Collect all predictions and ground truths
+        all_preds_key = []
+        all_targets_key = []
+        all_preds_non_key = []
+        all_targets_non_key = []
+        
+        for batch_idx, (img_key, target_key, img_non_key, target_non_key) in enumerate(val_dataloader):
             img_key = img_key.to(self.device)
-            img_non_key = img_non_key.to(self.device)
             target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                          for k, v in t.items()} for t in target_key]
-            target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                              for k, v in t.items()} for t in target_non_key]
+                        for k, v in t.items()} for t in target_key]
             
+            # ========== KEY FRAME ==========
             outputs_key = self.model.forward_key_frame(img_key, None)
-            outputs_non_key = self.model.forward_non_key_frame(img_non_key, None)
             
-            if 'pred_boxes' in outputs_key and 'pred_logits' in outputs_key:
-                pred_boxes_key = outputs_key['pred_boxes']  # [B, num_queries, 4]
-                pred_logits_key = outputs_key['pred_logits']  # [B, num_queries, num_classes]
-                pred_scores_key = pred_logits_key.softmax(-1)[:, :, :-1].max(-1)[0]  # Max class score
-                pred_labels_key = pred_logits_key.softmax(-1)[:, :, :-1].argmax(-1)  # Class label
+            # Postprocess key frame
+            orig_target_sizes_key = torch.stack([t["orig_size"] for t in target_key], dim=0)
+            results_key = self.postprocessor(outputs_key, orig_target_sizes_key)
+            
+            # Collect predictions and targets
+            for result, target in zip(results_key, target_key):
+                all_preds_key.append({
+                    'boxes': result['boxes'].cpu(),      # [N, 4] in xyxy format
+                    'scores': result['scores'].cpu(),    # [N]
+                    'labels': result['labels'].cpu(),    # [N]
+                })
+                all_targets_key.append({
+                    'boxes': target['boxes'].cpu(),      # [M, 4]
+                    'labels': target['labels'].cpu(),    # [M]
+                })
+            
+            # ========== NON-KEY FRAME ==========
+            if img_non_key is not None:
+                img_non_key = img_non_key.to(self.device)
+                target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                for k, v in t.items()} for t in target_non_key]
                 
-                # Store per-image predictions
-                for i in range(len(target_key)):
-                    score_threshold = 0.3
-                    keep = pred_scores_key[i] > score_threshold
-                    
-                    all_pred_boxes_key.append(pred_boxes_key[i][keep].cpu())
-                    all_pred_scores_key.append(pred_scores_key[i][keep].cpu())
-                    all_pred_labels_key.append(pred_labels_key[i][keep].cpu())
-                    all_gt_boxes_key.append(target_key[i]['boxes'].cpu())
-                    all_gt_labels_key.append(target_key[i]['labels'].cpu())
-            
-            # Process non-key frame predictions
-            if 'pred_boxes' in outputs_non_key and 'pred_logits' in outputs_non_key:
-                pred_boxes_non_key = outputs_non_key['pred_boxes']
-                pred_logits_non_key = outputs_non_key['pred_logits']
-                pred_scores_non_key = pred_logits_non_key.softmax(-1)[:, :, :-1].max(-1)[0]
-                pred_labels_non_key = pred_logits_non_key.softmax(-1)[:, :, :-1].argmax(-1)
+                # Forward non-key frame (using cached CCFF from key frame)
+                outputs_non_key = self.model.forward_non_key_frame(img_non_key, None)
                 
-                for i in range(len(target_non_key)):
-                    score_threshold = 0.3
-                    keep = pred_scores_non_key[i] > score_threshold
-                    
-                    all_pred_boxes_non_key.append(pred_boxes_non_key[i][keep].cpu())
-                    all_pred_scores_non_key.append(pred_scores_non_key[i][keep].cpu())
-                    all_pred_labels_non_key.append(pred_labels_non_key[i][keep].cpu())
-                    all_gt_boxes_non_key.append(target_non_key[i]['boxes'].cpu())
-                    all_gt_labels_non_key.append(target_non_key[i]['labels'].cpu())
+                # Postprocess non-key frame
+                orig_target_sizes_non_key = torch.stack([t["orig_size"] for t in target_non_key], dim=0)
+                results_non_key = self.postprocessor(outputs_non_key, orig_target_sizes_non_key)
+                
+                # Collect predictions and targets
+                for result, target in zip(results_non_key, target_non_key):
+                    all_preds_non_key.append({
+                        'boxes': result['boxes'].cpu(),
+                        'scores': result['scores'].cpu(),
+                        'labels': result['labels'].cpu(),
+                    })
+                    all_targets_non_key.append({
+                        'boxes': target['boxes'].cpu(),
+                        'labels': target['labels'].cpu(),
+                    })
             
-            if batch_idx % 50 == 0:
-                print(f"  Evaluated {batch_idx}/{len(val_dataloader)} batches")
+            if batch_idx % 10 == 0:
+                print(f"  Processed {batch_idx}/{len(val_dataloader)} batches")
         
-        # Compute mAP for key frame
-        print("\nComputing mAP for Key Frame Path...")
-        key_metrics = self._compute_map_simple(
-            all_pred_boxes_key, all_pred_scores_key, all_pred_labels_key,
-            all_gt_boxes_key, all_gt_labels_key
-        )
+        # ========== Compute mAP ==========
+        print("\n" + "="*80)
+        print("Computing mAP...")
+        print("="*80)
         
-        # Compute mAP for non-key frame
-        print("Computing mAP for Non-Key Frame Path...")
-        non_key_metrics = self._compute_map_simple(
-            all_pred_boxes_non_key, all_pred_scores_non_key, all_pred_labels_non_key,
-            all_gt_boxes_non_key, all_gt_labels_non_key
-        )
+        # Key frame mAP
+        mAP_key_50 = self._compute_map(all_preds_key, all_targets_key, iou_threshold=0.5)
+        mAP_key_75 = self._compute_map(all_preds_key, all_targets_key, iou_threshold=0.75)
         
-        metrics = {
-            'mAP_key': key_metrics['mAP'],
-            'mAP50_key': key_metrics['mAP50'],
-            'mAP75_key': key_metrics['mAP75'],
-            'mAP_non_key': non_key_metrics['mAP'],
-            'mAP50_non_key': non_key_metrics['mAP50'],
-            'mAP75_non_key': non_key_metrics['mAP75'],
-        }
+        # Non-key frame mAP (if available)
+        if len(all_preds_non_key) > 0:
+            mAP_non_key_50 = self._compute_map(all_preds_non_key, all_targets_non_key, iou_threshold=0.5)
+            mAP_non_key_75 = self._compute_map(all_preds_non_key, all_targets_non_key, iou_threshold=0.75)
+        else:
+            mAP_non_key_50 = 0.0
+            mAP_non_key_75 = 0.0
         
+        # Print results
         print(f"\n{'='*80}")
-        print(f"Evaluation Results (Paired Evaluation):")
-        print(f"  Key Frame Path:")
-        print(f"    mAP:    {metrics['mAP_key']:.4f}")
-        print(f"    mAP50:  {metrics['mAP50_key']:.4f}")
-        print(f"    mAP75:  {metrics['mAP75_key']:.4f}")
-        print(f"  Non-Key Frame Path:")
-        print(f"    mAP:    {metrics['mAP_non_key']:.4f}")
-        print(f"    mAP50:  {metrics['mAP50_non_key']:.4f}")
-        print(f"    mAP75:  {metrics['mAP75_non_key']:.4f}")
-        print(f"  Performance Gap: {(metrics['mAP_key'] - metrics['mAP_non_key']):.4f}")
+        print(f"Evaluation Results:")
+        print(f"{'='*80}")
+        print(f"KEY FRAME:")
+        print(f"  mAP@50: {mAP_key_50:.4f}")
+        print(f"  mAP@75: {mAP_key_75:.4f}")
+        if len(all_preds_non_key) > 0:
+            print(f"\nNON-KEY FRAME:")
+            print(f"  mAP@50: {mAP_non_key_50:.4f}")
+            print(f"  mAP@75: {mAP_non_key_75:.4f}")
+            print(f"\nDifference (Key - Non-Key):")
+            print(f"  mAP@50: {(mAP_key_50 - mAP_non_key_50):.4f}")
+            print(f"  mAP@75: {(mAP_key_75 - mAP_non_key_75):.4f}")
         print(f"{'='*80}\n")
         
-        self.model.train()
-        return metrics
-    
-    def _compute_map_simple(self, pred_boxes_list, pred_scores_list, pred_labels_list, 
-                           gt_boxes_list, gt_labels_list) -> Dict[str, float]:
+        return {
+            'key_mAP@50': mAP_key_50,
+            'key_mAP@75': mAP_key_75,
+            'non_key_mAP@50': mAP_non_key_50,
+            'non_key_mAP@75': mAP_non_key_75,
+        }
+
+    def _compute_map(self, predictions, targets, iou_threshold=0.5, num_classes=5):
         """
-        Compute mAP using simple IoU matching
+        Simple mAP computation
         
         Args:
-            pred_boxes_list: List of predicted boxes per image
-            pred_scores_list: List of prediction scores per image
-            pred_labels_list: List of prediction labels per image
-            gt_boxes_list: List of ground truth boxes per image
-            gt_labels_list: List of ground truth labels per image
+            predictions: List of dicts with 'boxes', 'scores', 'labels'
+            targets: List of dicts with 'boxes', 'labels'
+            iou_threshold: IoU threshold for matching
+            num_classes: Number of classes
         
         Returns:
-            metrics: Dict with mAP, mAP50, mAP75
+            mAP value
         """
         from torchvision.ops import box_iou
         
-        all_ious = []
-        all_scores = []
+        aps = []
         
-        for pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels in zip(
-            pred_boxes_list, pred_scores_list, pred_labels_list, gt_boxes_list, gt_labels_list
-        ):
-            if len(pred_boxes) == 0 or len(gt_boxes) == 0:
+        for cls in range(num_classes):
+            # Collect all predictions for this class
+            all_boxes = []
+            all_scores = []
+            all_matched = []  # Track which predictions matched ground truth
+            
+            # Collect all ground truth boxes for this class
+            num_gt_total = 0
+            
+            for pred, target in zip(predictions, targets):
+                # Predictions for this class
+                pred_mask = pred['labels'] == cls
+                pred_boxes = pred['boxes'][pred_mask]
+                pred_scores = pred['scores'][pred_mask]
+                
+                # Ground truth for this class
+                gt_mask = target['labels'] == cls
+                gt_boxes = target['boxes'][gt_mask]
+                num_gt_total += len(gt_boxes)
+                
+                # Match predictions to ground truth
+                if len(pred_boxes) > 0 and len(gt_boxes) > 0:
+                    ious = box_iou(pred_boxes, gt_boxes)  # [N, M]
+                    max_ious, max_indices = ious.max(dim=1)
+                    
+                    matched = max_ious >= iou_threshold
+                    all_matched.extend(matched.tolist())
+                elif len(pred_boxes) > 0:
+                    # Predictions but no ground truth - all false positives
+                    all_matched.extend([False] * len(pred_boxes))
+                
+                all_boxes.extend(pred_boxes.tolist())
+                all_scores.extend(pred_scores.tolist())
+            
+            if num_gt_total == 0:
+                # No ground truth for this class
                 continue
             
-            # Compute IoU between all predictions and ground truths
-            ious = box_iou(pred_boxes, gt_boxes)  # [num_preds, num_gts]
+            if len(all_scores) == 0:
+                # No predictions for this class
+                aps.append(0.0)
+                continue
             
-            # For each prediction, get the best matching GT
-            max_ious, max_indices = ious.max(dim=1)
+            # Sort by confidence
+            sorted_indices = sorted(range(len(all_scores)), key=lambda i: all_scores[i], reverse=True)
             
-            # Match labels
-            matched_labels = gt_labels[max_indices]
-            label_match = (pred_labels == matched_labels).float()
+            # Compute precision and recall
+            tp = 0
+            fp = 0
+            precisions = []
+            recalls = []
             
-            # Only count IoU if labels match
-            max_ious = max_ious * label_match
+            for idx in sorted_indices:
+                if all_matched[idx]:
+                    tp += 1
+                else:
+                    fp += 1
+                
+                precision = tp / (tp + fp)
+                recall = tp / num_gt_total
+                
+                precisions.append(precision)
+                recalls.append(recall)
             
-            all_ious.extend(max_ious.tolist())
-            all_scores.extend(pred_scores.tolist())
+            # Compute AP (area under precision-recall curve)
+            ap = 0.0
+            for i in range(1, len(recalls)):
+                ap += (recalls[i] - recalls[i-1]) * precisions[i]
+            
+            aps.append(ap)
         
-        if len(all_ious) == 0:
-            return {'mAP': 0.0, 'mAP50': 0.0, 'mAP75': 0.0}
+        # Return mean AP
+        if len(aps) == 0:
+            return 0.0
         
-        # Convert to tensors and sort by score
-        all_ious = torch.tensor(all_ious)
-        all_scores = torch.tensor(all_scores)
-        
-        sorted_indices = torch.argsort(all_scores, descending=True)
-        sorted_ious = all_ious[sorted_indices]
-        
-        # Compute precision at different IoU thresholds
-        mAP50 = (sorted_ious > 0.5).float().mean().item()
-        mAP75 = (sorted_ious > 0.75).float().mean().item()
-        
-        # Compute mAP as average over IoU thresholds 0.5:0.05:0.95 (COCO style)
-        mAP = 0.0
-        for iou_thresh in torch.arange(0.5, 1.0, 0.05):
-            mAP += (sorted_ious > iou_thresh).float().mean().item()
-        mAP /= 10  # Average over 10 thresholds
-        
-        return {'mAP': mAP, 'mAP50': mAP50, 'mAP75': mAP75}
+        return sum(aps) / len(aps)
     
     def save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
         """Save model checkpoint"""
@@ -626,12 +650,16 @@ def main():
     if args.debug:
             val_dataloader = DebugSubsetDataLoader(val_dataloader, args.debug_batches)
     
+    postprocessor = cfg.postprocessor
+
     # Trainer
     trainer = Phase1Trainer(
         model=model,
         criterion=criterion,
         optimizer=optimizer,
         dataloader=train_dataloader,
+        postprocessor = postprocessor,
+        cfg=cfg,
         device=device,
         lambda_non_key=lambda_non_key,
         output_dir=output_dir,

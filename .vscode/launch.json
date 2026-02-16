@@ -49,7 +49,8 @@
             "justMyCode": false,
             "args": [
                 "-c",
-                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml"
+                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml",
+                "--test-only"
             ],
             "cwd": "${workspaceFolder}",
             "env": {

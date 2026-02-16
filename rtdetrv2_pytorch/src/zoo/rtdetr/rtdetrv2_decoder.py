@@ -551,7 +551,7 @@ class RTDETRTransformerv2(nn.Module):
         return topk_memory, topk_logits, topk_coords
 
 
-    def forward(self, feats, return_query = False, targets=None):
+    def forward(self, feats, targets=None, return_query = False):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
         

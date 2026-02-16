@@ -220,7 +220,7 @@ class ViratTemporalDataset(Dataset):
         """Get annotations for an image"""
         anns = []
         for ann in self.coco_data['annotations']:
-            if ann['image_id'] == img_id:
+            if ann['id'] == img_id:
                 anns.append(ann)
         return anns
     
@@ -303,7 +303,7 @@ class ViratTemporalDataset(Dataset):
             img_non_key, target_non_key = self._apply_default_transform(img_non_key, target_non_key)
         
         return (img_key, target_key, img_non_key, target_non_key)
-    
+     
     def set_epoch(self, epoch):
         """Set epoch for reproducibility"""
         self._epoch = epoch
