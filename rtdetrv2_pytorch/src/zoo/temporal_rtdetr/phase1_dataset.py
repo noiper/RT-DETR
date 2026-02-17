@@ -61,7 +61,14 @@ class ViratTemporalDataset(Dataset):
             raise FileNotFoundError(f"Annotation file not found: {ann_file}")
             
         with open(ann_file, 'r') as f:
-            self.coco_data = json.load(f)
+            self.virat_data = json.load(f)
+
+        self.img_to_anns = {}
+        for ann in self.virat_data['annotations']:
+            img_id = ann['image_id']
+            if img_id not in self.img_to_anns:
+                self.img_to_anns[img_id] = []
+            self.img_to_anns[img_id].append(ann)
         
         # Build video-frame mapping
         self.video_frames = self._build_video_frame_mapping()
@@ -79,7 +86,7 @@ class ViratTemporalDataset(Dataset):
         """Build mapping from video_id to sorted list of frames"""
         video_frames = {}
         
-        for img_info in self.coco_data['images']:
+        for img_info in self.virat_data['images']:
             video_id = self._extract_video_id(img_info['file_name'])
             
             if video_id not in video_frames:
@@ -218,11 +225,12 @@ class ViratTemporalDataset(Dataset):
     
     def _get_annotations(self, img_id: int) -> List[Dict]:
         """Get annotations for an image"""
-        anns = []
-        for ann in self.coco_data['annotations']:
-            if ann['id'] == img_id:
-                anns.append(ann)
-        return anns
+        # anns = []
+        # for ann in self.virat_data['annotations']:
+        #     if ann['image_id'] == img_id:
+        #         anns.append(ann)
+        # return anns
+        return self.img_to_anns.get(img_id, [])
     
     def _prepare_target(self, anns: List[Dict], img_info: Dict) -> Dict:
         """Prepare target dictionary from annotations"""

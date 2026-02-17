@@ -225,9 +225,7 @@ class Phase1Trainer:
         
         print(f"\n{'='*80}")
         print(f"Evaluating Epoch {epoch}...")
-        print(f"  Evaluating BOTH key and non-key frames")
-        print(f"{'='*80}")
-        
+
         # Collect all predictions and ground truths
         all_preds_key = []
         all_targets_key = []
@@ -235,27 +233,24 @@ class Phase1Trainer:
         all_targets_non_key = []
         
         for batch_idx, (img_key, target_key, img_non_key, target_non_key) in enumerate(val_dataloader):
+            # ============ KEY FRAME ============
             img_key = img_key.to(self.device)
             target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                         for k, v in t.items()} for t in target_key]
-            
-            # ========== KEY FRAME ==========
             outputs_key = self.model.forward_key_frame(img_key, None)
-            
-            # Postprocess key frame
+
             orig_target_sizes_key = torch.stack([t["orig_size"] for t in target_key], dim=0)
             results_key = self.postprocessor(outputs_key, orig_target_sizes_key)
             
-            # Collect predictions and targets
             for result, target in zip(results_key, target_key):
                 all_preds_key.append({
-                    'boxes': result['boxes'].cpu(),      # [N, 4] in xyxy format
-                    'scores': result['scores'].cpu(),    # [N]
-                    'labels': result['labels'].cpu(),    # [N]
+                    'boxes': result['boxes'].cpu(),
+                    'scores': result['scores'].cpu(),
+                    'labels': result['labels'].cpu(),
                 })
                 all_targets_key.append({
-                    'boxes': target['boxes'].cpu(),      # [M, 4]
-                    'labels': target['labels'].cpu(),    # [M]
+                    'boxes': target['boxes'].cpu(),
+                    'labels': target['labels'].cpu(),
                 })
             
             # ========== NON-KEY FRAME ==========
@@ -263,15 +258,11 @@ class Phase1Trainer:
                 img_non_key = img_non_key.to(self.device)
                 target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                                 for k, v in t.items()} for t in target_non_key]
-                
-                # Forward non-key frame (using cached CCFF from key frame)
                 outputs_non_key = self.model.forward_non_key_frame(img_non_key, None)
                 
-                # Postprocess non-key frame
                 orig_target_sizes_non_key = torch.stack([t["orig_size"] for t in target_non_key], dim=0)
                 results_non_key = self.postprocessor(outputs_non_key, orig_target_sizes_non_key)
                 
-                # Collect predictions and targets
                 for result, target in zip(results_non_key, target_non_key):
                     all_preds_non_key.append({
                         'boxes': result['boxes'].cpu(),
@@ -285,11 +276,9 @@ class Phase1Trainer:
             
             if batch_idx % 10 == 0:
                 print(f"  Processed {batch_idx}/{len(val_dataloader)} batches")
-        
-        # ========== Compute mAP ==========
+
         print("\n" + "="*80)
         print("Computing mAP...")
-        print("="*80)
         
         # Key frame mAP
         mAP_key_50 = self._compute_map(all_preds_key, all_targets_key, iou_threshold=0.5)
