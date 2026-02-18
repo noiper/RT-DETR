@@ -63,12 +63,13 @@ class ViratTemporalDataset(Dataset):
         with open(ann_file, 'r') as f:
             self.virat_data = json.load(f)
 
-        self.img_to_anns = {}
+        self.img_id_to_info = {img['id']: img for img in self.virat_data['images']}
+        self.img_id_to_anns = {}
         for ann in self.virat_data['annotations']:
-            img_id = ann['image_id']
-            if img_id not in self.img_to_anns:
-                self.img_to_anns[img_id] = []
-            self.img_to_anns[img_id].append(ann)
+            image_id = ann['image_id'] 
+            if image_id not in self.img_id_to_anns:
+                self.img_id_to_anns[image_id] = []
+            self.img_id_to_anns[image_id].append(ann)
         
         # Build video-frame mapping
         self.video_frames = self._build_video_frame_mapping()
@@ -223,14 +224,14 @@ class ViratTemporalDataset(Dataset):
             raise FileNotFoundError(f"Image not found: {img_path}")
         return Image.open(img_path).convert('RGB')
     
-    def _get_annotations(self, img_id: int) -> List[Dict]:
+    def _get_annotations(self, filename: str) -> List[Dict]:
         """Get annotations for an image"""
         # anns = []
         # for ann in self.virat_data['annotations']:
         #     if ann['image_id'] == img_id:
         #         anns.append(ann)
         # return anns
-        return self.img_to_anns.get(img_id, [])
+        return self.filename_to_anns.get(filename, [])
     
     def _prepare_target(self, anns: List[Dict], img_info: Dict) -> Dict:
         """Prepare target dictionary from annotations"""
@@ -255,8 +256,8 @@ class ViratTemporalDataset(Dataset):
             'image_id': torch.tensor([img_info['id']]),
             'area': torch.as_tensor(areas, dtype=torch.float32) if areas else torch.zeros((0,)),
             'iscrowd': torch.as_tensor(iscrowd, dtype=torch.int64) if iscrowd else torch.zeros((0,), dtype=torch.int64),
-            'orig_size': torch.as_tensor([h, w]),
-            'size': torch.as_tensor([h, w]),
+            'orig_size': torch.as_tensor([w, h]),
+            'size': torch.as_tensor([w, h]),
         }
 
         target['boxes'] = convert_to_tv_tensor(target['boxes'], key='boxes', spatial_size=(h, w))
@@ -298,7 +299,7 @@ class ViratTemporalDataset(Dataset):
         
         # Load key frame and non-key frame
         img_key, img_non_key = self._load_image(frame_t), self._load_image(frame_t_s)
-        anns_key, anns_non_key = self._get_annotations(frame_t['id']), self._get_annotations(frame_t_s['id'])
+        anns_key, anns_non_key = self.img_id_to_anns.get(frame_t['id'], []), self.img_id_to_anns.get(frame_t_s['id'], [])
         target_key, target_non_key = self._prepare_target(anns_key, frame_t), self._prepare_target(anns_non_key, frame_t_s)
         
         # Apply transforms

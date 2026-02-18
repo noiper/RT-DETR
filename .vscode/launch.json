@@ -24,24 +24,24 @@
             }
         },
         {
-            "name": "Python: RT-DETR Train (CPU)",
+            "name": "Test Eval",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/test_best_pth_simple.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
                 "-c",
-                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml"
+                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
+                // "--debug",
             ],
             "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
-                "CUDA_VISIBLE_DEVICES": "" 
             }
         },
         {
-            "name": "Python: RT-DETR Train (GPU)",
+            "name": "Test Eval COCO",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
@@ -50,12 +50,14 @@
             "args": [
                 "-c",
                 "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml",
-                "--test-only"
+                "--test-only",
+                "--resume",
+                "best.pth",
             ],
             "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
             }
-        }
+        },
     ]
 }
