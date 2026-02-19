@@ -16,6 +16,7 @@ import numpy as np
 
 from src.core import register
 from ...data._misc import convert_to_tv_tensor
+from pycocotools.coco import COCO
 
 @register()
 class ViratTemporalDataset(Dataset):
@@ -54,6 +55,8 @@ class ViratTemporalDataset(Dataset):
         self.max_frame_gap = max_frame_gap
         self.pair_sampling_strategy = pair_sampling_strategy
         self.frame_stride = frame_stride
+
+        self.coco = COCO(ann_file)
 
         # Load annotations
         ann_file_path = Path(ann_file)
