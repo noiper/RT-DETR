@@ -15,7 +15,7 @@
                 "--pretrained",
                 "best.pth",
                 "--training_strategy",
-                "freeze_key"
+                "joint"
             ],
             "cwd": "${workspaceFolder}",
             "env": {

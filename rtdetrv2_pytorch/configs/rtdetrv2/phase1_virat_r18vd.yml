@@ -13,7 +13,7 @@ summary_dir: './output/phase1_virat_r18vd/summary'
 # Override to ResNet18
 PResNet:
   depth: 18
-  freeze_at: 0
+  freeze_at: 4
   freeze_norm: True
   pretrained: True
 

@@ -218,9 +218,7 @@ class Phase1Trainer:
         Evaluate model on validation set using official COCO API.
         Computes mAP for both Key and Non-Key frames independently.
         """
-        # 0. Prerequisites
-        
-        
+        import gc
         self.model.eval()
         if self.criterion is not None:
             self.criterion.eval()
@@ -271,6 +269,10 @@ class Phase1Trainer:
             stats.update({f'non_key_{k}': v for k, v in nk_stats.items()})
             print(f"Gap (Key - NonKey) mAP@50: {k_stats['mAP@50'] - nk_stats['mAP@50']:.4f}")
 
+        del results_key
+        del results_non_key
+        gc.collect()
+
         print(f"{'='*80}\n")
         return stats
 
@@ -293,7 +295,8 @@ class Phase1Trainer:
                 })
 
     def _run_coco_eval(self, coco_gt, results_list):
-        """Helper to run COCOeval on a list of results"""      
+        """Helper to run COCOeval on a list of results"""
+        import gc
         if not results_list:
             print("  No predictions generated.")
             return {'mAP': 0.0, 'mAP@50': 0.0, 'mAP@75': 0.0}
@@ -303,6 +306,10 @@ class Phase1Trainer:
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
+
+        del coco_dt
+        del coco_eval
+        gc.collect()
         
         return {
             'mAP': coco_eval.stats[0],
