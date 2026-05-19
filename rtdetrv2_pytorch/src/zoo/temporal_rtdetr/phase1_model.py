@@ -152,7 +152,7 @@ class LightweightDecoder(RTDETRTransformerv2):
         feat_flatten = torch.concat(feat_flatten, 1)
         return feat_flatten, spatial_shapes
 
-    def forward(self, feats, cached_content, cached_points_unact):
+    def forward(self, feats, cached_content, cached_points_unact, return_query_states: bool = False):
         """
         Forward pass using cached query embeddings from key frame
         
@@ -167,7 +167,7 @@ class LightweightDecoder(RTDETRTransformerv2):
         # Get input proj
         memory, spatial_shapes = self._get_encoder_input(feats)
         
-        out_bboxes, out_logits = self.decoder(
+        decoder_out = self.decoder(
             cached_content,
             cached_points_unact,
             memory,
@@ -176,12 +176,16 @@ class LightweightDecoder(RTDETRTransformerv2):
             self.dec_score_head,
             self.query_pos_head,
             attn_mask=None,
+            return_intermediate_queries=return_query_states,
         )
+        if return_query_states:
+            out_bboxes, out_logits, query_states = decoder_out
+        else:
+            out_bboxes, out_logits = decoder_out
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
 
-        # pred_logits = output['pred_logits']
-        # pred_boxes = output['pred_boxes']
-        
+        if return_query_states:
+            return out, query_states
         return out
 
 
@@ -502,6 +506,7 @@ class TemporalRTDETR(nn.Module):
         return outputs
     
     def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None, return_fused: bool = False,
+                              return_kd_cache: bool = False,
                               cached_ccff: Optional[List[torch.Tensor]] = None,
                               cached_content: Optional[torch.Tensor] = None,
                               cached_points_unact: Optional[torch.Tensor] = None,
@@ -513,6 +518,7 @@ class TemporalRTDETR(nn.Module):
             img: Non-key frame image [B, C, H, W]
             targets: Ground truth annotations
             return_fused: Whether to return fused features
+            return_kd_cache: Whether to return student query/reference internals for KD
             cached_ccff: Optional cached multi-scale features (for ONNX export)
             cached_content: Optional cached query content (for ONNX export)
             cached_points_unact: Optional cached reference points (for ONNX export)
@@ -567,17 +573,37 @@ class TemporalRTDETR(nn.Module):
             )
             adjusted_points_unact = self.cached_points_unact + delta_points_unact
         
+        student_query_states = None
         # Use lightweight or full decoder
         if self.use_lightweight_decoder and self.lightweight_decoder is not None:
             # Use single-layer decoder (trainable)
-            # Call with only positional argument (memory)
-            outputs = self.lightweight_decoder(decoder_input, self.cached_content, adjusted_points_unact)
+            if return_kd_cache:
+                outputs, student_query_states = self.lightweight_decoder(
+                    decoder_input,
+                    self.cached_content,
+                    adjusted_points_unact,
+                    return_query_states=True,
+                )
+            else:
+                outputs = self.lightweight_decoder(decoder_input, self.cached_content, adjusted_points_unact)
         else:
             # Use full decoder
             outputs = self.decoder(decoder_input, targets=targets)
 
+        if return_fused and return_kd_cache:
+            kd_cache = {
+                'student_query_states': student_query_states,
+                'adjusted_points_unact': adjusted_points_unact,
+            }
+            return outputs, fused_features, kd_cache
         if return_fused:
             return outputs, fused_features
+        if return_kd_cache:
+            kd_cache = {
+                'student_query_states': student_query_states,
+                'adjusted_points_unact': adjusted_points_unact,
+            }
+            return outputs, kd_cache
         return outputs
 
     def extract_s5(self, img: torch.Tensor) -> torch.Tensor:

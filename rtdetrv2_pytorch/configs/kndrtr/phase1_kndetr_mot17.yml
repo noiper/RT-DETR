@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/skip3/phase1_mot17_match'
-summary_dir: './output/skip3/phase1_mot17_match/summary'
+output_dir: './output/skip3/phase1_mot17_no_delta'
+summary_dir: './output/skip3/phase1_mot17_no_delta/summary'
 
 # Override to ResNet18
 PResNet:
@@ -33,7 +33,12 @@ RTDETRTransformer:
 
 # Phase 1 Temporal Training Specific Parameters
 lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
-lambda_score: 0.0        # Keep score KD disabled for controlled delta-vs-no-delta comparison
+lambda_score: 1.0        # Keep score KD disabled for controlled delta-vs-no-delta comparison
+lambda_query_kd: 0.1     # Query-state KD weight (teacher non-key full decoder -> student non-key)
+lambda_delta_kd: 1.0     # Delta KD weight (xy only)
+query_kd_teacher_layer: -1
+query_kd_student_layer: -1
+delta_kd_teacher_layer: -1
 
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)

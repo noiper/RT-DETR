@@ -140,6 +140,11 @@ def _phase1_runtime_cfg(
     lambda_non_key: float,
     lambda_kd: float,
     lambda_score: float,
+    lambda_query_kd: float,
+    lambda_delta_kd: float,
+    query_kd_teacher_layer: int,
+    query_kd_student_layer: int,
+    delta_kd_teacher_layer: int,
     reuse_match_indices: bool,
     same_frame: bool,
 ) -> Dict[str, object]:
@@ -153,6 +158,11 @@ def _phase1_runtime_cfg(
         'lambda_non_key': lambda_non_key,
         'lambda_kd': lambda_kd,
         'lambda_score': lambda_score,
+        'lambda_query_kd': lambda_query_kd,
+        'lambda_delta_kd': lambda_delta_kd,
+        'query_kd_teacher_layer': query_kd_teacher_layer,
+        'query_kd_student_layer': query_kd_student_layer,
+        'delta_kd_teacher_layer': delta_kd_teacher_layer,
         'enable_ref_delta': yaml_cfg.get('enable_ref_delta', False),
         'ref_delta_hidden_dim': yaml_cfg.get('ref_delta_hidden_dim', 128),
         'ref_delta_scale': yaml_cfg.get('ref_delta_scale', 0.2),
@@ -211,6 +221,11 @@ class Phase1Trainer:
         self.reuse_match_indices = reuse_match_indices
         self.provenance = provenance or {}
         self.lambda_score = float(_cfg_get(self.cfg, 'lambda_score', 15.0))
+        self.lambda_query_kd = float(_cfg_get(self.cfg, 'lambda_query_kd', 0.0))
+        self.lambda_delta_kd = float(_cfg_get(self.cfg, 'lambda_delta_kd', 0.0))
+        self.query_kd_teacher_layer = int(_cfg_get(self.cfg, 'query_kd_teacher_layer', -1))
+        self.query_kd_student_layer = int(_cfg_get(self.cfg, 'query_kd_student_layer', -1))
+        self.delta_kd_teacher_layer = int(_cfg_get(self.cfg, 'delta_kd_teacher_layer', -1))
         
         valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
@@ -222,9 +237,24 @@ class Phase1Trainer:
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.training_strategy in ['kd', 'joint']:
                self.lambda_kd = float(_cfg_get(self.cfg, 'lambda_kd', 150.0))
-               if self.training_strategy == 'kd' or self.lambda_kd > 0 or self.lambda_score > 0:
+               if (
+                   self.training_strategy == 'kd'
+                   or self.lambda_kd > 0
+                   or self.lambda_score > 0
+                   or self.lambda_query_kd > 0
+                   or self.lambda_delta_kd > 0
+               ):
                    print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
                    print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
+                   print(f"  - Query KD weight (lambda_query_kd): {self.lambda_query_kd}")
+                   print(f"  - Delta KD weight (lambda_delta_kd): {self.lambda_delta_kd}")
+                   if self.lambda_query_kd > 0:
+                       print(
+                           f"  - Query KD layers teacher/student: "
+                           f"{self.query_kd_teacher_layer}/{self.query_kd_student_layer}"
+                       )
+                   if self.lambda_delta_kd > 0:
+                       print(f"  - Delta KD teacher layer: {self.delta_kd_teacher_layer}")
         else:
                self.lambda_kd = 0.0
 
@@ -251,6 +281,21 @@ class Phase1Trainer:
             sanitized.append((src_idx[valid], tgt_idx[valid]))
         return sanitized
 
+    @staticmethod
+    def _resolve_state_layer(states: List[Tuple[torch.Tensor, torch.Tensor]], layer_idx: int) -> int:
+        if not states:
+            raise ValueError("query states list is empty")
+        resolved = layer_idx if layer_idx >= 0 else len(states) + layer_idx
+        if resolved < 0:
+            resolved = 0
+        if resolved >= len(states):
+            resolved = len(states) - 1
+        return resolved
+
+    @staticmethod
+    def _gt_to_query_map(src_idx: torch.Tensor, tgt_idx: torch.Tensor) -> Dict[int, int]:
+        return {int(t.item()): int(s.item()) for s, t in zip(src_idx, tgt_idx)}
+
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """
         Train one epoch with temporal frame pairs
@@ -271,6 +316,8 @@ class Phase1Trainer:
         # Track KD components for logging
         total_feat_mse = 0.0
         total_score_mse = 0.0
+        total_query_kd = 0.0
+        total_delta_kd = 0.0
 
         for batch_idx, batch in enumerate(self.dataloader):
             img_key, target_key, img_non_key, target_non_key = batch
@@ -296,6 +343,8 @@ class Phase1Trainer:
             loss_non_key_value = 0.0
             loss_kd_feat = 0.0
             loss_kd_score = 0.0
+            loss_kd_query = 0.0
+            loss_kd_delta = 0.0
 
             # 1. KEY FRAME PATH (The Teacher)
             if self.training_strategy == 'joint':
@@ -331,17 +380,52 @@ class Phase1Trainer:
                             )
 
             # 2. NON-KEY FRAME PATH (The Student)
-            use_kd = self.training_strategy in ['kd', 'kd_only'] or (self.training_strategy == 'joint' and (self.lambda_kd > 0 or self.lambda_score > 0))
+            use_kd = self.training_strategy in ['kd', 'kd_only'] or (
+                self.training_strategy == 'joint'
+                and (
+                    self.lambda_kd > 0
+                    or self.lambda_score > 0
+                    or self.lambda_query_kd > 0
+                    or self.lambda_delta_kd > 0
+                )
+            )
             if use_kd:
 
+                need_teacher_decoder_kd = (
+                    self.lambda_score > 0
+                    or self.lambda_query_kd > 0
+                    or self.lambda_delta_kd > 0
+                )
                 with torch.no_grad():
                     teacher_backbone_feats = self.model.backbone(img_non_key)
                     teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
                     teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
+                    if need_teacher_decoder_kd:
+                        outputs_teacher_nk, teacher_query_states = self.model.decoder(
+                            teacher_ccff,
+                            targets=target_non_key,
+                            return_query=True,
+                        )
+                        teacher_indices = self.criterion.matcher(
+                            {'pred_logits': outputs_teacher_nk['pred_logits'], 'pred_boxes': outputs_teacher_nk['pred_boxes']},
+                            target_non_key,
+                        )['indices']
+                    else:
+                        outputs_teacher_nk, teacher_query_states, teacher_indices = None, None, None
 
-                outputs_non_key, student_fused = self.model.forward_non_key_frame(
-                    img_non_key, target_non_key, return_fused=True
-                )
+                need_student_kd_cache = (self.lambda_query_kd > 0 or self.lambda_delta_kd > 0)
+                if need_student_kd_cache:
+                    outputs_non_key, student_fused, kd_cache = self.model.forward_non_key_frame(
+                        img_non_key,
+                        target_non_key,
+                        return_fused=True,
+                        return_kd_cache=True,
+                    )
+                else:
+                    outputs_non_key, student_fused = self.model.forward_non_key_frame(
+                        img_non_key, target_non_key, return_fused=True
+                    )
+                    kd_cache = None
 
                 # --- Feature KD Logic ---
                 if self.lambda_kd > 0:
@@ -364,33 +448,112 @@ class Phase1Trainer:
                 loss_hungarian = sum(loss_dict_non_key.values())
 
                 if self.lambda_score > 0:
+                    if outputs_teacher_nk is None or teacher_indices is None:
+                        raise RuntimeError("Score KD requires teacher non-key decoder outputs and matcher indices")
                     batch_size = outputs_non_key['pred_logits'].shape[0]
                     student_probs = outputs_non_key['pred_logits'].sigmoid()
                     with torch.no_grad():
-                        teacher_probs = outputs_key['pred_logits'].sigmoid()
+                        teacher_probs = outputs_teacher_nk['pred_logits'].sigmoid()
 
                     num_matched_common = 0
                     for b in range(batch_size):
-                        k_src, k_tgt = key_indices[b]
+                        t_src, t_tgt = teacher_indices[b]
                         nk_src, nk_tgt = non_key_indices[b]
-                        k_map = {t.item(): s for s, t in zip(k_src, k_tgt)}
-                        nk_map = {t.item(): s for s, t in zip(nk_src, nk_tgt)}
-                        common_gts = set(k_map.keys()) & set(nk_map.keys())
+                        t_map = self._gt_to_query_map(t_src, t_tgt)
+                        nk_map = self._gt_to_query_map(nk_src, nk_tgt)
+                        common_gts = set(t_map.keys()) & set(nk_map.keys())
                         for g in common_gts:
-                            s_idx = nk_map[g]; t_idx = k_map[g]
+                            s_idx = nk_map[g]
+                            t_idx = t_map[g]
                             loss_kd_score += F.mse_loss(student_probs[b, s_idx], teacher_probs[b, t_idx].detach())
                             num_matched_common += 1
                     if num_matched_common > 0:
                         loss_kd_score /= num_matched_common
 
+                if self.lambda_query_kd > 0:
+                    if kd_cache is None or teacher_query_states is None or teacher_indices is None:
+                        raise RuntimeError("Query KD requires student KD cache and teacher query states")
+                    student_query_states = kd_cache.get('student_query_states', None)
+                    if student_query_states is None:
+                        raise RuntimeError("Student KD cache missing student_query_states")
+
+                    teacher_layer = self._resolve_state_layer(teacher_query_states, self.query_kd_teacher_layer)
+                    student_layer = self._resolve_state_layer(student_query_states, self.query_kd_student_layer)
+                    teacher_query = teacher_query_states[teacher_layer][0]
+                    student_query = student_query_states[student_layer][0]
+
+                    matched_query_pairs = 0
+                    for b in range(student_query.shape[0]):
+                        t_src, t_tgt = teacher_indices[b]
+                        nk_src, nk_tgt = non_key_indices[b]
+                        t_map = self._gt_to_query_map(t_src, t_tgt)
+                        nk_map = self._gt_to_query_map(nk_src, nk_tgt)
+                        common = sorted(set(t_map.keys()) & set(nk_map.keys()))
+                        if not common:
+                            continue
+                        t_idx = torch.tensor([t_map[g] for g in common], device=self.device, dtype=torch.long)
+                        s_idx = torch.tensor([nk_map[g] for g in common], device=self.device, dtype=torch.long)
+                        t_query = teacher_query[b, t_idx].detach()
+                        s_query = student_query[b, s_idx]
+                        loss_kd_query += F.smooth_l1_loss(
+                            F.normalize(s_query, dim=-1),
+                            F.normalize(t_query, dim=-1),
+                            reduction='sum',
+                        )
+                        matched_query_pairs += len(common)
+                    if matched_query_pairs > 0:
+                        loss_kd_query /= matched_query_pairs
+
+                if self.lambda_delta_kd > 0:
+                    if kd_cache is None or teacher_query_states is None or teacher_indices is None:
+                        raise RuntimeError("Delta KD requires student KD cache and teacher query states")
+                    adjusted_points_unact = kd_cache.get('adjusted_points_unact', None)
+                    if adjusted_points_unact is None:
+                        raise RuntimeError("Student KD cache missing adjusted_points_unact")
+                    teacher_layer = self._resolve_state_layer(teacher_query_states, self.delta_kd_teacher_layer)
+                    teacher_points_unact = teacher_query_states[teacher_layer][1]
+
+                    matched_delta_pairs = 0
+                    for b in range(adjusted_points_unact.shape[0]):
+                        t_src, t_tgt = teacher_indices[b]
+                        nk_src, nk_tgt = non_key_indices[b]
+                        t_map = self._gt_to_query_map(t_src, t_tgt)
+                        nk_map = self._gt_to_query_map(nk_src, nk_tgt)
+                        common = sorted(set(t_map.keys()) & set(nk_map.keys()))
+                        if not common:
+                            continue
+                        t_idx = torch.tensor([t_map[g] for g in common], device=self.device, dtype=torch.long)
+                        s_idx = torch.tensor([nk_map[g] for g in common], device=self.device, dtype=torch.long)
+
+                        # Distill only query centers (x, y) as requested.
+                        teacher_xy = torch.sigmoid(teacher_points_unact[b, t_idx, :2]).detach()
+                        student_xy = torch.sigmoid(adjusted_points_unact[b, s_idx, :2])
+                        loss_kd_delta += F.smooth_l1_loss(student_xy, teacher_xy, reduction='sum')
+                        matched_delta_pairs += len(common)
+                    if matched_delta_pairs > 0:
+                        loss_kd_delta /= matched_delta_pairs
+
                 # Assign to non-key loss
                 if self.training_strategy == 'kd_only':
-                    loss_non_key = self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
+                    loss_non_key = (
+                        self.lambda_kd * loss_kd_feat
+                        + self.lambda_score * loss_kd_score
+                        + self.lambda_query_kd * loss_kd_query
+                        + self.lambda_delta_kd * loss_kd_delta
+                    )
                 else:
-                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
+                    loss_non_key = (
+                        loss_hungarian
+                        + self.lambda_kd * loss_kd_feat
+                        + self.lambda_score * loss_kd_score
+                        + self.lambda_query_kd * loss_kd_query
+                        + self.lambda_delta_kd * loss_kd_delta
+                    )
 
                 total_feat_mse += loss_kd_feat.item() if isinstance(loss_kd_feat, torch.Tensor) else loss_kd_feat
                 total_score_mse += loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
+                total_query_kd += loss_kd_query.item() if isinstance(loss_kd_query, torch.Tensor) else loss_kd_query
+                total_delta_kd += loss_kd_delta.item() if isinstance(loss_kd_delta, torch.Tensor) else loss_kd_delta
 
             else:
                 # Standard Hungarian loss (decoder_only, freeze_key, and joint)
@@ -438,17 +601,26 @@ class Phase1Trainer:
             if batch_idx % self.print_freq == 0:
                 f_mse = loss_kd_feat.item() if isinstance(loss_kd_feat, torch.Tensor) else loss_kd_feat
                 s_mse = loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
+                q_kd = loss_kd_query.item() if isinstance(loss_kd_query, torch.Tensor) else loss_kd_query
+                d_kd = loss_kd_delta.item() if isinstance(loss_kd_delta, torch.Tensor) else loss_kd_delta
                 
                 if self.training_strategy == 'kd_only':
                     print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})")
+                          f"Loss: {loss.item():.4f} "
+                          f"(Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f}, "
+                          f"Query KD: {q_kd:.6f}, Delta KD: {d_kd:.6f})")
                 elif self.training_strategy == 'kd':
                     print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Hungarian: {loss_hungarian.item():.4f}, Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})")
+                          f"Loss: {loss.item():.4f} "
+                          f"(Hungarian: {loss_hungarian.item():.4f}, Feat MSE: {f_mse:.6f}, "
+                          f"Score MSE: {s_mse:.6f}, Query KD: {q_kd:.6f}, Delta KD: {d_kd:.6f})")
                 elif self.training_strategy == 'joint':
                     kd_info = ""
-                    if self.lambda_kd > 0 or self.lambda_score > 0:
-                        kd_info = f" (Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})"
+                    if self.lambda_kd > 0 or self.lambda_score > 0 or self.lambda_query_kd > 0 or self.lambda_delta_kd > 0:
+                        kd_info = (
+                            f" (Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f}, "
+                            f"Query KD: {q_kd:.6f}, Delta KD: {d_kd:.6f})"
+                        )
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
                           f"Loss: {loss.item():.4f} "
                           f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f}){kd_info}")
@@ -462,6 +634,8 @@ class Phase1Trainer:
 
         avg_feat_mse = total_feat_mse / len(self.dataloader)
         avg_score_mse = total_score_mse / len(self.dataloader)
+        avg_query_kd = total_query_kd / len(self.dataloader)
+        avg_delta_kd = total_delta_kd / len(self.dataloader)
 
         return {
             'loss': avg_loss,
@@ -469,6 +643,8 @@ class Phase1Trainer:
             'loss_non_key': avg_loss_non_key,
             'feat_mse': avg_feat_mse,
             'score_mse': avg_score_mse,
+            'query_kd': avg_query_kd,
+            'delta_kd': avg_delta_kd,
             'train_key': self.training_strategy == 'joint',
         }
         
@@ -600,6 +776,11 @@ class Phase1Trainer:
                 lambda_non_key=self.lambda_non_key,
                 lambda_kd=self.lambda_kd,
                 lambda_score=self.lambda_score,
+                lambda_query_kd=self.lambda_query_kd,
+                lambda_delta_kd=self.lambda_delta_kd,
+                query_kd_teacher_layer=self.query_kd_teacher_layer,
+                query_kd_student_layer=self.query_kd_student_layer,
+                delta_kd_teacher_layer=self.delta_kd_teacher_layer,
                 reuse_match_indices=self.reuse_match_indices,
                 same_frame=self.same_frame,
             ),
@@ -739,6 +920,16 @@ def main():
                        help='Weighted scale for KD loss (only used in kd strategy)')
     parser.add_argument('--lambda_score', type=float, default=None,
                        help='Weighted scale for Score KD loss (only used in kd strategy)')
+    parser.add_argument('--lambda_query_kd', type=float, default=None,
+                       help='Weighted scale for query-state KD loss')
+    parser.add_argument('--lambda_delta_kd', type=float, default=None,
+                       help='Weighted scale for reference-point delta KD loss (xy only)')
+    parser.add_argument('--query_kd_teacher_layer', type=int, default=None,
+                       help='Teacher query-state layer index for query KD (default: -1)')
+    parser.add_argument('--query_kd_student_layer', type=int, default=None,
+                       help='Student query-state layer index for query KD (default: -1)')
+    parser.add_argument('--delta_kd_teacher_layer', type=int, default=None,
+                       help='Teacher query-state layer index for delta KD target points (default: -1)')
 
     # Optional
     parser.add_argument('--resume', '-r', type=str, default=None, 
@@ -858,6 +1049,16 @@ def main():
         
         if args.lambda_score is not None:
             cfg.lambda_score = args.lambda_score
+        if args.lambda_query_kd is not None:
+            cfg.lambda_query_kd = args.lambda_query_kd
+        if args.lambda_delta_kd is not None:
+            cfg.lambda_delta_kd = args.lambda_delta_kd
+        if args.query_kd_teacher_layer is not None:
+            cfg.query_kd_teacher_layer = args.query_kd_teacher_layer
+        if args.query_kd_student_layer is not None:
+            cfg.query_kd_student_layer = args.query_kd_student_layer
+        if args.delta_kd_teacher_layer is not None:
+            cfg.delta_kd_teacher_layer = args.delta_kd_teacher_layer
 
         summary_dir = _cfg_get(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
         writer = SummaryWriter(log_dir=summary_dir)
@@ -870,6 +1071,10 @@ def main():
         print(f"  Lambda (non-key): {lambda_non_key}")
         print(f"  Lambda KD:        {_cfg_get(cfg, 'lambda_kd', 150.0)}")
         print(f"  Lambda score:     {_cfg_get(cfg, 'lambda_score', 15.0)}")
+        print(f"  Lambda query KD:  {_cfg_get(cfg, 'lambda_query_kd', 0.0)}")
+        print(f"  Lambda delta KD:  {_cfg_get(cfg, 'lambda_delta_kd', 0.0)}")
+        print(f"  Query KD T/S:     {_cfg_get(cfg, 'query_kd_teacher_layer', -1)}/{_cfg_get(cfg, 'query_kd_student_layer', -1)}")
+        print(f"  Delta KD layer:   {_cfg_get(cfg, 'delta_kd_teacher_layer', -1)}")
         print(f"  Output dir:       {output_dir}")
         print(f"  Seed:             {seed}")
         
