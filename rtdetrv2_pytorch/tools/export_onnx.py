@@ -58,6 +58,17 @@ def _build_temporal_model(cfg):
         num_queries=num_queries,
         use_lightweight_decoder=cfg.yaml_cfg.get('use_lightweight_decoder', False),
         reuse_position=cfg.yaml_cfg.get('reuse_position', 0),
+        enable_apg=cfg.yaml_cfg.get('enable_apg', False),
+        apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
+        apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
+        apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
+        enable_ref_delta=cfg.yaml_cfg.get('enable_ref_delta', False),
+        ref_delta_hidden_dim=cfg.yaml_cfg.get('ref_delta_hidden_dim', 128),
+        ref_delta_scale=cfg.yaml_cfg.get('ref_delta_scale', 0.2),
+        ref_delta_in_channels=cfg.yaml_cfg.get('ref_delta_in_channels', 512),
+        ref_delta_xy_scale=cfg.yaml_cfg.get('ref_delta_xy_scale', None),
+        ref_delta_wh_scale=cfg.yaml_cfg.get('ref_delta_wh_scale', None),
+        ref_delta_zero_init_last=cfg.yaml_cfg.get('ref_delta_zero_init_last', False),
     )
     return temporal_model
 
@@ -88,8 +99,17 @@ def main(args):
         else:
             print("   [Warning] Model does not support decoupling, skipping...")
 
+    if getattr(model, 'enable_ref_delta', False):
+        raise RuntimeError(
+            "ONNX export with enable_ref_delta=True is not supported in this iteration. "
+            "Disable ref delta in config for export, or extend ONNX NonKeyModel cache inputs first."
+        )
+
     try:
-        model.load_state_dict(state, strict=True)
+        if hasattr(model, 'load_state_dict_compatible'):
+            model.load_state_dict_compatible(state)
+        else:
+            model.load_state_dict(state, strict=True)
     except RuntimeError as e:
         raise RuntimeError(
             f"Failed to load checkpoint into TemporalRTDETR. "

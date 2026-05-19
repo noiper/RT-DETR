@@ -226,12 +226,14 @@ def _extract_total_loss(loss_dict: Dict[str, torch.Tensor]) -> float:
     return sum(loss_dict[k] for k in relevant_keys).item()
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in Real-Time Simulation")
+    parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in low-rate sampling simulation")
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to config yml')
     parser.add_argument('--weights','-w',  type=str, required=True, help='Path to checkpoint .pth file')
     parser.add_argument('--warmup', type=int, default=10, help='Ignore first N batches for timing/memory')
-    parser.add_argument('--skip', '-s', type=int, default=0,
-                        help='Number of frames to skip between evaluations. Default 0.')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='Validation dataloader workers. Default 0 for deterministic low-rate evaluation.')
+    parser.add_argument('--skip', '-s', type=int, default=None,
+                        help='Frames skipped between sampled frames. If omitted, uses checkpoint val max_frame_gap - 1 when available.')
     parser.add_argument('--baseline', action='store_true',
                         help='Baseline: reuse key-frame detections directly for non-key frames')
     parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0,
@@ -243,6 +245,31 @@ def main():
     parser.add_argument('--score_grid', type=str, default='1.0,1.02,1.04,1.06,1.08,1.10,1.12,1.14,1.16,1.18,1.20',
                         help='Comma-separated scale grid for --tune_score')
     args = parser.parse_args()
+
+    if args.num_workers < 0:
+        raise ValueError(f'--num_workers must be >= 0, got {args.num_workers}')
+
+    checkpoint = torch.load(args.weights, map_location='cpu', weights_only=False)
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+    run_config = checkpoint.get('run_config', {}) if isinstance(checkpoint, dict) else {}
+    val_run_config = run_config.get('val_dataloader_dataset', {}) if isinstance(run_config, dict) else {}
+    checkpoint_gap = val_run_config.get('max_frame_gap') if isinstance(val_run_config, dict) else None
+    if args.skip is None:
+        if isinstance(checkpoint_gap, int) and checkpoint_gap > 0:
+            args.skip = checkpoint_gap - 1
+            print(f"Using --skip {args.skip} from checkpoint run_config val max_frame_gap={checkpoint_gap}.")
+        else:
+            args.skip = 0
+            print("No --skip provided and checkpoint has no run_config val max_frame_gap; defaulting to --skip 0.")
+    if args.skip < 0:
+        raise ValueError(f'--skip must be >= 0, got {args.skip}')
+    sample_stride = args.skip + 1
+    if isinstance(checkpoint_gap, int) and checkpoint_gap > 0 and checkpoint_gap != sample_stride:
+        print(
+            "WARNING: checkpoint validation gap does not match requested evaluation gap. "
+            f"checkpoint max_frame_gap={checkpoint_gap}, requested Key->NK offset={sample_stride}. "
+            f"To reproduce the checkpoint filename mAP, use --skip {checkpoint_gap - 1}."
+        )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Deployment Device: {device}")
@@ -250,7 +277,7 @@ def main():
     # 1. Load the raw config
     cfg = YAMLConfig(args.config)
     
-    # --- HARDCODE BATCH SIZE TO 1 FOR REAL-TIME SIMULATION ---
+    # --- HARDCODE VALIDATION PAIRS TO MATCH LOW-RATE K/NK SAMPLING ---
     if 'val_dataloader' in cfg.yaml_cfg:
         print("Forcing validation batch_size=1 and drop_last=False for accurate real-time metrics.")
         if 'batch_size' in cfg.yaml_cfg['val_dataloader']:
@@ -259,10 +286,14 @@ def main():
             cfg.yaml_cfg['val_dataloader']['drop_last'] = False
 
         if 'dataset' in cfg.yaml_cfg['val_dataloader']:
-            print("Forcing dataset max_frame_gap=1, frame_stride=1, pair_sampling_strategy='all' to simulate continuous stream.")
-            cfg.yaml_cfg['val_dataloader']['dataset']['max_frame_gap'] = 1
-            cfg.yaml_cfg['val_dataloader']['dataset']['frame_stride'] = 1
-            cfg.yaml_cfg['val_dataloader']['dataset']['pair_sampling_strategy'] = 'all'
+            print(
+                "Forcing validation dataset to fixed-gap low-rate pairs: "
+                f"max_frame_gap={sample_stride}, frame_stride={2 * sample_stride}, "
+                "pair_sampling_strategy='fixed_gap'."
+            )
+            cfg.yaml_cfg['val_dataloader']['dataset']['max_frame_gap'] = sample_stride
+            cfg.yaml_cfg['val_dataloader']['dataset']['frame_stride'] = 2 * sample_stride
+            cfg.yaml_cfg['val_dataloader']['dataset']['pair_sampling_strategy'] = 'fixed_gap'
     
     # 2. Build Model Architecture
     base_model = cfg.model.to(device)
@@ -286,12 +317,21 @@ def main():
         num_queries=num_queries,
         use_lightweight_decoder=cfg.yaml_cfg.get('use_lightweight_decoder', False),
         reuse_position=cfg.yaml_cfg.get('reuse_position', 0),
+        enable_apg=cfg.yaml_cfg.get('enable_apg', False),
+        apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
+        apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
+        apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
+        enable_ref_delta=cfg.yaml_cfg.get('enable_ref_delta', False),
+        ref_delta_hidden_dim=cfg.yaml_cfg.get('ref_delta_hidden_dim', 128),
+        ref_delta_scale=cfg.yaml_cfg.get('ref_delta_scale', 0.2),
+        ref_delta_in_channels=cfg.yaml_cfg.get('ref_delta_in_channels', 512),
+        ref_delta_xy_scale=cfg.yaml_cfg.get('ref_delta_xy_scale', None),
+        ref_delta_wh_scale=cfg.yaml_cfg.get('ref_delta_wh_scale', None),
+        ref_delta_zero_init_last=cfg.yaml_cfg.get('ref_delta_zero_init_last', False),
     ).to(device)
     
     # 3. Load Weights
     print(f"Loading weights from {args.weights}...")
-    checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
-    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
 
     # --- AUTO-DECOUPLE DETECTION ---
     # If the checkpoint contains decoupled non-key heads, we MUST decouple the model
@@ -301,7 +341,10 @@ def main():
         print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
         model.decouple_non_key_prediction_heads()
     
-    model.load_state_dict(state_dict, strict=True)
+    if hasattr(model, 'load_state_dict_compatible'):
+        model.load_state_dict_compatible(state_dict)
+    else:
+        model.load_state_dict(state_dict, strict=True)
     model.eval()
     
     # --- PHYSICAL DATALOADER REBUILD FOR BATCH_SIZE=1 ---
@@ -314,12 +357,12 @@ def main():
     base_val_loader.dataset.transforms.transforms.append(SanitizeBoundingBoxes(min_size=1))
     base_val_loader.dataset.transforms.transforms.append(ConvertBoxes(fmt='cxcywh', normalize=True))
 
-    print("Rebuilding validation dataloader to force batch_size=1...")
+    print(f"Rebuilding validation dataloader to force batch_size=1, num_workers={args.num_workers}...")
     val_dataloader = DataLoader(
         dataset=base_val_loader.dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=base_val_loader.num_workers,
+        num_workers=args.num_workers,
         collate_fn=base_val_loader.collate_fn,
         drop_last=False
     )
@@ -354,160 +397,121 @@ def main():
         'nk_time': 0.0, 'nk_mem': 0.0, 'nk_frames': 0, 'nk_loss': 0.0
     }
 
-    frame_idx = 0
-    last_video_id = None
-
-    print(f"\n--- INITIATING LOW RATE SIMULATION (Skip: {args.skip}) ---")
+    print(
+        "\n--- INITIATING LOW RATE SIMULATION "
+        f"(Skipped frames: {args.skip}, sample stride: {sample_stride}, "
+        f"Key->NK offset: {sample_stride}) ---"
+    )
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(val_dataloader, desc="Streaming Video")):
-            img_key, target_key, _, _ = batch
-            
-            # --- VIDEO BOUNDARY DETECTION & CYCLE RESET ---
-            img_id = int(target_key[0]['image_id'].item())
-            img_info = val_dataloader.dataset.img_id_to_info[img_id]
-            current_video_id = extract_video_id(img_info['file_name'])
-            
-            if last_video_id is not None and current_video_id != last_video_id:
-                # Video changed! Reset the simulation cycle to start with a Key frame.
-                frame_idx = 0
-            last_video_id = current_video_id
-            
-            # LOW RATE SKIP LOGIC
-            if frame_idx % (args.skip + 1) != 0:
-                frame_idx += 1
-                continue
-            
-            eval_idx = frame_idx // (args.skip + 1)
-            is_key_frame = (eval_idx % 2 == 0)
-            
-            # Use original image size for ALL evaluation and diagnostic coordinate scaling
-            orig_size = target_key[0]['orig_size'].to(device) # [W, H]
-            target_loss = prepare_targets_for_loss(target_key, device)
+        for i, batch in enumerate(tqdm(val_dataloader, desc="Low-rate pairs")):
+            img_key, target_key, img_non_key, target_non_key = batch
 
             # ==========================================
-            # KEY FRAME PASS
+            # KEY FRAME PASS: t
             # ==========================================
-            if is_key_frame:
-                img_key = img_key.to(device)
-                target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
-                
+            img_key = img_key.to(device)
+            target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
+            target_loss_key = prepare_targets_for_loss(target_key, device)
+            orig_size_key = target_key[0]['orig_size'].to(device)  # [W, H]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+
+            t0 = time.perf_counter()
+            out_k = model.forward_key_frame(img_key, None)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+
+            orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
+            latest_key_results = postprocessor(out_k, orig_sizes_k)[0]
+
+            record_stats(latest_key_results, target_key, key_ious, key_confs, args.score_thr, device, orig_size_key.unsqueeze(0))
+            record_tp_fp_stats(latest_key_results, target_key, key_tp_scores, key_fp_scores, args.score_thr, device, orig_size_key.unsqueeze(0))
+
+            if i >= args.warmup:
+                metrics['k_time'] += (t1 - t0)
+                metrics['k_frames'] += 1
+                if torch.cuda.is_available():
+                    metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+                loss_dict = criterion(out_k, target_loss_key)
+                metrics['k_loss'] += _extract_total_loss(loss_dict)
+                loss_stats['key']['class'].append(loss_dict['loss_vfl'].item())
+                loss_stats['key']['box'].append((loss_dict['loss_bbox'] + loss_dict['loss_giou']).item())
+
+            format_coco(target_key, [latest_key_results], res_key)
+            for t in target_key:
+                eval_img_ids_key.add(int(t['image_id'].item()))
+
+            if args.baseline:
+                norm_size = torch.tensor([[1.0, 1.0]], device=device)
+                latest_key_results_norm = postprocessor(out_k, norm_size)[0]
+
+            # ==========================================
+            # NON-KEY FRAME PASS: t + sample_stride
+            # ==========================================
+            target_non_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
+            target_loss_nk = prepare_targets_for_loss(target_non_key, device)
+            orig_size_nk = target_non_key[0]['orig_size'].to(device)  # [W, H]
+
+            if args.baseline:
+                if latest_key_results_norm is None:
+                    raise RuntimeError("No cached key results available for non-key propagation")
+                t2 = time.perf_counter()
+                # Scale normalized key boxes to the CURRENT non-key frame's original resolution.
+                res_nk_batch = {
+                    'boxes': latest_key_results_norm['boxes'] * orig_size_nk.repeat(2),
+                    'scores': latest_key_results_norm['scores'],
+                    'labels': latest_key_results_norm['labels']
+                }
+                t3 = time.perf_counter()
+
+                if i >= args.warmup:
+                    l_dict_nk = criterion(out_k, target_loss_nk)
+                    metrics['nk_loss'] += _extract_total_loss(l_dict_nk)
+                    loss_stats['nk']['class'].append(l_dict_nk['loss_vfl'].item())
+                    loss_stats['nk']['box'].append((l_dict_nk['loss_bbox'] + l_dict_nk['loss_giou']).item())
+            else:
+                img_non_key = img_non_key.to(device)
+
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                     torch.cuda.reset_peak_memory_stats()
-                
-                t0 = time.perf_counter()
-                
-                # Forward pass natively caches the features for upcoming Non-Key frames
-                out_k = model.forward_key_frame(img_key, None)
-                
+
+                t2 = time.perf_counter()
+                out_nk = model.forward_non_key_frame(img_non_key, None)
+
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                t1 = time.perf_counter()
-                
-                orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
-                latest_key_results = postprocessor(out_k, orig_sizes_k)[0]
-                
-                # Diagnostics
-                record_stats(latest_key_results, target_key, key_ious, key_confs, args.score_thr, device, orig_size.unsqueeze(0))
-                record_tp_fp_stats(latest_key_results, target_key, key_tp_scores, key_fp_scores, args.score_thr, device, orig_size.unsqueeze(0))
+                t3 = time.perf_counter()
+
+                orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(device)
+                res_nk_batch = postprocessor(out_nk, orig_sizes_nk)[0]
 
                 if i >= args.warmup:
-                    metrics['k_time'] += (t1 - t0)
-                    metrics['k_frames'] += 1
-                    if torch.cuda.is_available():
-                        metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
-                    
-                    # Loss tracking
-                    loss_dict = criterion(out_k, target_loss)
-                    metrics['k_loss'] += _extract_total_loss(loss_dict)
-                    loss_stats['key']['class'].append(loss_dict['loss_vfl'].item())
-                    loss_stats['key']['box'].append((loss_dict['loss_bbox'] + loss_dict['loss_giou']).item())
-                
-                format_coco(target_key, [latest_key_results], res_key)
-                for t in target_key:
-                    eval_img_ids_key.add(int(t['image_id'].item()))
-                
-                if args.baseline:
-                    norm_size = torch.tensor([[1.0, 1.0]], device=device)
-                    latest_key_results_norm = postprocessor(out_k, norm_size)[0]
-            
-            # ==========================================
-            # NON-KEY FRAME PASS
-            # ==========================================
-            else:
-                target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
-                if args.baseline:
-                    if latest_key_results_norm is None:
-                        raise RuntimeError("No cached key results available for non-key propagation")
-                    t2 = time.perf_counter()
-                    # Scale normalized key boxes to the CURRENT frame's original resolution
-                    res_nk_batch = {
-                        'boxes': latest_key_results_norm['boxes'] * orig_size.repeat(2),
-                        'scores': latest_key_results_norm['scores'],
-                        'labels': latest_key_results_norm['labels']
-                    }
-                    t3 = time.perf_counter()
+                    loss_dict = criterion(out_nk, target_loss_nk)
+                    metrics['nk_loss'] += _extract_total_loss(loss_dict)
+                    loss_stats['nk']['class'].append(loss_dict['loss_vfl'].item())
+                    loss_stats['nk']['box'].append((loss_dict['loss_bbox'] + loss_dict['loss_giou']).item())
 
-                    # Baseline Loss Computation:
-                    # We pass the cached key outputs through the criterion against the current NK ground truth
-                    if i >= args.warmup:
-                        # Construct a mock output dictionary that the criterion can process
-                        # latest_key_results_norm contains 'boxes', 'scores', 'labels'
-                        # We need 'pred_logits' and 'pred_boxes' in normalized cxcywh
-                        # latest_key_results_norm['boxes'] is already normalized xyxy, need to convert
-                        
-                        # Note: This assumes out_k was cached. We need out_k from the Key pass.
-                        # Since out_k is exactly what produced latest_key_results_norm, 
-                        # we can just use the cached out_k for loss computation against tnk_loss.
-                        l_dict_nk = criterion(out_k, target_loss)
-                        metrics['nk_loss'] += _extract_total_loss(l_dict_nk)
-                        loss_stats['nk']['class'].append(l_dict_nk['loss_vfl'].item())
-                        loss_stats['nk']['box'].append((l_dict_nk['loss_bbox'] + l_dict_nk['loss_giou']).item())
+            record_stats(res_nk_batch, target_non_key, nk_ious, nk_confs, args.score_thr, device, orig_size_nk.unsqueeze(0))
+            record_tp_fp_stats(res_nk_batch, target_non_key, nk_tp_scores, nk_fp_scores, args.score_thr, device, orig_size_nk.unsqueeze(0))
+
+            if i >= args.warmup:
+                if not args.baseline:
+                    metrics['nk_time'] += (t3 - t2)
+                    metrics['nk_frames'] += 1
+                    if torch.cuda.is_available():
+                        metrics['nk_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
                 else:
-                    img_key = img_key.to(device)
-                    
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                        torch.cuda.reset_peak_memory_stats()
-                    
-                    t2 = time.perf_counter()
-                    
-                    # Relies on the cache stored during key frame pass
-                    out_nk = model.forward_non_key_frame(img_key, None)
-                    
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t3 = time.perf_counter()
-                    
-                    orig_sizes_nk = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
-                    res_nk_batch = postprocessor(out_nk, orig_sizes_nk)[0]
+                    metrics['nk_frames'] += 1
 
-                    if i >= args.warmup:
-                        # Loss tracking for non-key model
-                        loss_dict = criterion(out_nk, target_loss)
-                        metrics['nk_loss'] += _extract_total_loss(loss_dict)
-                        loss_stats['nk']['class'].append(loss_dict['loss_vfl'].item())
-                        loss_stats['nk']['box'].append((loss_dict['loss_bbox'] + loss_dict['loss_giou']).item())
-                
-                # Diagnostics
-                record_stats(res_nk_batch, target_key, nk_ious, nk_confs, args.score_thr, device, orig_size.unsqueeze(0))
-                record_tp_fp_stats(res_nk_batch, target_key, nk_tp_scores, nk_fp_scores, args.score_thr, device, orig_size.unsqueeze(0))
-
-                if i >= args.warmup:
-                    if not args.baseline:
-                        metrics['nk_time'] += (t3 - t2)
-                        metrics['nk_frames'] += 1
-                        if torch.cuda.is_available():
-                            metrics['nk_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
-                    else:
-                        # For baseline, we still track frames but time is near-zero
-                        metrics['nk_frames'] += 1
-                
-                format_coco(target_key, [res_nk_batch], res_nk)
-                for t in target_key:
-                    eval_img_ids_nk.add(int(t['image_id'].item()))
-            
-            frame_idx += 1
+            format_coco(target_non_key, [res_nk_batch], res_nk)
+            for t in target_non_key:
+                eval_img_ids_nk.add(int(t['image_id'].item()))
 
     # Calculate Averages
     avg_k_time = (metrics['k_time'] / metrics['k_frames']) * 1000 if metrics['k_frames'] else 0
@@ -554,7 +558,7 @@ def main():
     stats_combined = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
 
     print("\n" + "="*70)
-    print(f"FINAL SUMMARY (Skip: {args.skip})")
+    print(f"FINAL SUMMARY (Skipped frames: {args.skip} | Sample stride / Key->NK offset: {sample_stride})")
     print("="*70)
     print(f"Score scale -> non-key: {nonkey_scale:.3f}")
 

@@ -5,6 +5,10 @@ import copy
 from typing import Dict, List, Tuple, Optional
 from ..rtdetr.rtdetrv2_decoder import RTDETRTransformerv2, TransformerDecoder
 
+OPTIONAL_REF_DELTA_PREFIX = 'ref_delta_adapter.'
+OPTIONAL_APG_PREFIX = 'apg.'
+OPTIONAL_PREFIXES = (OPTIONAL_REF_DELTA_PREFIX, OPTIONAL_APG_PREFIX)
+
 class TemporalFusionBlock(nn.Module):
     """
     Fusion block for combining non-key frame features (S) with cached key frame features (CCFF)
@@ -221,6 +225,123 @@ class AdaptivePropagationGate(nn.Module):
         return logits, probs
 
 
+class ReferenceDeltaAdapter(nn.Module):
+    """Predict per-query reference-point deltas using local + global S5 residual cues."""
+
+    def __init__(
+        self,
+        query_dim: int = 256,
+        s5_channels: int = 512,
+        hidden_dim: int = 128,
+        delta_scale: float = 0.2,
+        xy_scale: Optional[float] = None,
+        wh_scale: Optional[float] = None,
+        zero_init_last: bool = False,
+    ):
+        super().__init__()
+        self.query_dim = int(query_dim)
+        self.s5_channels = int(s5_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.delta_scale = float(delta_scale)
+        self.xy_scale = float(xy_scale if xy_scale is not None else delta_scale)
+        self.wh_scale = float(wh_scale if wh_scale is not None else (0.5 * delta_scale))
+
+        # Project pooled residual context [B, C5] -> [B, Cq]
+        self.global_proj = nn.Sequential(
+            nn.Linear(self.s5_channels, self.hidden_dim, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.query_dim, bias=True),
+        )
+
+        # Project per-query sampled residual context [B, Q, C5] -> [B, Q, Cq]
+        self.local_proj = nn.Sequential(
+            nn.Linear(self.s5_channels, self.hidden_dim, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.query_dim, bias=True),
+        )
+
+        # Light refinement on cached query content [B, Q, Cq]
+        self.content_proj = nn.Linear(self.query_dim, self.query_dim, bias=True)
+
+        fused_dim = self.query_dim * 3
+        self.delta_trunk = nn.Sequential(
+            nn.Linear(fused_dim, self.hidden_dim, bias=True),
+            nn.ReLU(inplace=True),
+        )
+        self.delta_xy_head = nn.Linear(self.hidden_dim, 2, bias=True)
+        self.delta_wh_head = nn.Linear(self.hidden_dim, 2, bias=True)
+
+        # Query-wise motion gate from local residual token [B, Q, Cq] -> [B, Q, 1]
+        gate_hidden = max(16, self.hidden_dim // 2)
+        self.motion_gate = nn.Sequential(
+            nn.Linear(self.query_dim, gate_hidden, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(gate_hidden, 1, bias=True),
+        )
+
+        # Optional strict zero-init for ablation parity. Default keeps random init for faster learning.
+        if zero_init_last:
+            nn.init.constant_(self.delta_xy_head.weight, 0.0)
+            nn.init.constant_(self.delta_xy_head.bias, 0.0)
+            nn.init.constant_(self.delta_wh_head.weight, 0.0)
+            nn.init.constant_(self.delta_wh_head.bias, 0.0)
+
+        # Bias gate toward passing some motion signal at startup.
+        nn.init.constant_(self.motion_gate[-1].bias, 1.0)
+
+    def forward(
+        self,
+        cached_content: torch.Tensor,
+        cached_points_unact: torch.Tensor,
+        cached_key_s5: torch.Tensor,
+        current_s5: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            cached_content: Cached decoder content from key frame [B, Q, C]
+            cached_points_unact: Cached unactivated ref points [B, Q, 4]
+            cached_key_s5: Cached key S5 feature [B, C5, H5, W5]
+            current_s5: Current non-key S5 feature [B, C5, H5, W5]
+
+        Returns:
+            delta_points_unact: Delta in unactivated reference-point space [B, Q, 4]
+        """
+        # S5 residual in feature space: [B, C5, H5, W5]
+        residual = current_s5 - cached_key_s5
+
+        # Global residual descriptor: [B, C5] -> [B, Q, Cq]
+        residual_global = F.adaptive_avg_pool2d(residual, output_size=1).flatten(1)
+        global_token = self.global_proj(residual_global)
+        global_token = global_token.unsqueeze(1).expand(-1, cached_content.shape[1], -1)
+
+        # Sample local residual at each query center from cached key references.
+        # Query centers are normalized [0, 1] after sigmoid.
+        ref_xy = cached_points_unact[..., :2].sigmoid().clamp(1e-4, 1.0 - 1e-4)  # [B, Q, 2]
+        grid = (ref_xy * 2.0 - 1.0).unsqueeze(2)  # [B, Q, 1, 2], grid_sample expects [-1, 1]
+        sampled = F.grid_sample(
+            residual,
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False,
+        )  # [B, C5, Q, 1]
+        local_residual = sampled.squeeze(-1).permute(0, 2, 1).contiguous()  # [B, Q, C5]
+        local_token = self.local_proj(local_residual)  # [B, Q, Cq]
+
+        content_token = self.content_proj(cached_content)  # [B, Q, Cq]
+        fused = torch.cat([content_token, local_token, global_token], dim=-1)  # [B, Q, 3Cq]
+        trunk = self.delta_trunk(fused)  # [B, Q, H]
+
+        # Predict center/size corrections separately and bound them for stability.
+        delta_xy = torch.tanh(self.delta_xy_head(trunk)) * self.xy_scale  # [B, Q, 2]
+        delta_wh = torch.tanh(self.delta_wh_head(trunk)) * self.wh_scale  # [B, Q, 2]
+
+        # Motion-aware gate suppresses noisy updates on near-static queries.
+        gate = torch.sigmoid(self.motion_gate(local_token.abs()))  # [B, Q, 1]
+        delta_unact = torch.cat([delta_xy, delta_wh], dim=-1) * gate  # [B, Q, 4]
+        return delta_unact
+
+
 class TemporalRTDETR(nn.Module):
     """
     Temporal RT-DETR for Phase 1 training
@@ -241,6 +362,13 @@ class TemporalRTDETR(nn.Module):
         apg_in_channels: int = 512,
         apg_hidden_channels: int = 64,
         apg_pool_size: int = 4,
+        enable_ref_delta: bool = False,
+        ref_delta_hidden_dim: int = 128,
+        ref_delta_scale: float = 0.2,
+        ref_delta_in_channels: int = 512,
+        ref_delta_xy_scale: Optional[float] = None,
+        ref_delta_wh_scale: Optional[float] = None,
+        ref_delta_zero_init_last: bool = False,
     ):
         super().__init__()
         
@@ -253,6 +381,7 @@ class TemporalRTDETR(nn.Module):
         self.use_lightweight_decoder = use_lightweight_decoder
         self.reuse_position = int(reuse_position)
         self.enable_apg = bool(enable_apg)
+        self.enable_ref_delta = bool(enable_ref_delta)
         self.decoder_num_layers = getattr(getattr(decoder, 'decoder', None), 'num_layers', None)
         if self.reuse_position < 0:
             raise ValueError(f"reuse_position must be >= 0, but got {self.reuse_position}")
@@ -291,11 +420,54 @@ class TemporalRTDETR(nn.Module):
                 in_channels=apg_in_channels,
                 hidden_channels=apg_hidden_channels,
                 pool_size=apg_pool_size,
-            )
+            ).to(device)
+
+        self.ref_delta_adapter = None
+        if self.enable_ref_delta:
+            self.ref_delta_adapter = ReferenceDeltaAdapter(
+                query_dim=hidden_dim,
+                s5_channels=ref_delta_in_channels,
+                hidden_dim=ref_delta_hidden_dim,
+                delta_scale=ref_delta_scale,
+                xy_scale=ref_delta_xy_scale,
+                wh_scale=ref_delta_wh_scale,
+                zero_init_last=ref_delta_zero_init_last,
+            ).to(device)
         
         print(f"  Success!")
         print(f"  - Use lightweight decoder: {use_lightweight_decoder}")
         print(f"  - Reuse position: {self.reuse_position}")
+        print(f"  - Enable reference delta: {self.enable_ref_delta}")
+        if self.enable_ref_delta and self.ref_delta_adapter is not None:
+            print(
+                f"  - Ref delta scales (xy/wh): "
+                f"{self.ref_delta_adapter.xy_scale:.3f}/{self.ref_delta_adapter.wh_scale:.3f}"
+            )
+
+    def load_state_dict_compatible(self, state_dict: Dict[str, torch.Tensor]) -> Tuple[List[str], List[str]]:
+        """
+        Load checkpoint while allowing optional module mismatches only.
+        Optional prefixes: ref_delta_adapter.*, apg.*
+        Returns (missing_keys, unexpected_keys) from torch.load_state_dict(strict=False).
+        """
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        ref_missing = [k for k in missing if k.startswith(OPTIONAL_REF_DELTA_PREFIX)]
+        ref_unexpected = [k for k in unexpected if k.startswith(OPTIONAL_REF_DELTA_PREFIX)]
+        if self.enable_ref_delta and (ref_missing or ref_unexpected):
+            print(
+                "  [Compat] ref_delta_adapter checkpoint mismatch detected: "
+                f"missing={len(ref_missing)}, unexpected={len(ref_unexpected)}. "
+                "This checkpoint used a different delta adapter structure."
+            )
+        disallowed_missing = [k for k in missing if not k.startswith(OPTIONAL_PREFIXES)]
+        disallowed_unexpected = [k for k in unexpected if not k.startswith(OPTIONAL_PREFIXES)]
+        if disallowed_missing or disallowed_unexpected:
+            raise RuntimeError(
+                "Incompatible checkpoint keys when loading TemporalRTDETR. "
+                f"missing(non-optional)={disallowed_missing[:8]}, "
+                f"unexpected(non-optional)={disallowed_unexpected[:8]}"
+            )
+        return missing, unexpected
     
     def forward_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Tuple:
         """
@@ -332,7 +504,8 @@ class TemporalRTDETR(nn.Module):
     def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None, return_fused: bool = False,
                               cached_ccff: Optional[List[torch.Tensor]] = None,
                               cached_content: Optional[torch.Tensor] = None,
-                              cached_points_unact: Optional[torch.Tensor] = None) -> Dict:
+                              cached_points_unact: Optional[torch.Tensor] = None,
+                              cached_key_s5: Optional[torch.Tensor] = None) -> Dict:
         """
         Forward non-key frame through lightweight pipeline with fusion
         
@@ -343,6 +516,7 @@ class TemporalRTDETR(nn.Module):
             cached_ccff: Optional cached multi-scale features (for ONNX export)
             cached_content: Optional cached query content (for ONNX export)
             cached_points_unact: Optional cached reference points (for ONNX export)
+            cached_key_s5: Optional cached key S5 feature (for deployment paths)
         
         Returns:
             outputs: Detection outputs
@@ -354,6 +528,8 @@ class TemporalRTDETR(nn.Module):
             self.cached_content = cached_content
         if cached_points_unact is not None:
             self.cached_points_unact = cached_points_unact
+        if cached_key_s5 is not None:
+            self.cached_key_s5 = cached_key_s5
 
         if self.cached_ccff is None:
             raise RuntimeError("Key frame must be processed first to cache CCFF features")
@@ -375,12 +551,27 @@ class TemporalRTDETR(nn.Module):
         
         # Prepare decoder input (fused multi-scale features)
         decoder_input = fused_features
+
+        adjusted_points_unact = self.cached_points_unact
+        if self.enable_ref_delta:
+            if self.ref_delta_adapter is None:
+                raise RuntimeError("Reference delta is enabled but adapter module is missing")
+            if self.cached_key_s5 is None:
+                raise RuntimeError("Reference delta requires cached key S5 from forward_key_frame")
+            # Per-query geometric correction in unactivated reference-point space: [B, Q, 4]
+            delta_points_unact = self.ref_delta_adapter(
+                cached_content=self.cached_content,
+                cached_points_unact=self.cached_points_unact,
+                cached_key_s5=self.cached_key_s5,
+                current_s5=s5,
+            )
+            adjusted_points_unact = self.cached_points_unact + delta_points_unact
         
         # Use lightweight or full decoder
         if self.use_lightweight_decoder and self.lightweight_decoder is not None:
             # Use single-layer decoder (trainable)
             # Call with only positional argument (memory)
-            outputs = self.lightweight_decoder(decoder_input, self.cached_content, self.cached_points_unact)
+            outputs = self.lightweight_decoder(decoder_input, self.cached_content, adjusted_points_unact)
         else:
             # Use full decoder
             outputs = self.decoder(decoder_input, targets=targets)
@@ -466,6 +657,13 @@ def build_temporal_rtdetr(cfg):
         apg_in_channels=cfg.get('apg_in_channels', 512),
         apg_hidden_channels=cfg.get('apg_hidden_channels', 64),
         apg_pool_size=cfg.get('apg_pool_size', 4),
+        enable_ref_delta=cfg.get('enable_ref_delta', False),
+        ref_delta_hidden_dim=cfg.get('ref_delta_hidden_dim', 128),
+        ref_delta_scale=cfg.get('ref_delta_scale', 0.2),
+        ref_delta_in_channels=cfg.get('ref_delta_in_channels', 512),
+        ref_delta_xy_scale=cfg.get('ref_delta_xy_scale', None),
+        ref_delta_wh_scale=cfg.get('ref_delta_wh_scale', None),
+        ref_delta_zero_init_last=cfg.get('ref_delta_zero_init_last', False),
     )
     
     return model

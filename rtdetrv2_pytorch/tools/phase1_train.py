@@ -33,6 +33,9 @@ NON_KEY_HEAD_PREFIXES = (
     'lightweight_decoder.dec_bbox_head',
     'lightweight_decoder.query_pos_head',
 )
+OPTIONAL_REF_DELTA_PREFIX = 'ref_delta_adapter.'
+OPTIONAL_APG_PREFIX = 'apg.'
+OPTIONAL_STATE_PREFIXES = (OPTIONAL_REF_DELTA_PREFIX, OPTIONAL_APG_PREFIX)
 
 
 def _state_fingerprint(state_dict: Dict[str, torch.Tensor], prefixes: Tuple[str, ...]) -> Dict[str, object]:
@@ -89,6 +92,78 @@ def _compare_prefixed_state_dicts(
         'max_abs_diff': max_abs_diff,
     }
 
+
+def _load_temporal_checkpoint_compatible(
+    model: TemporalRTDETR,
+    state_dict: Dict[str, torch.Tensor],
+) -> Tuple[List[str], List[str]]:
+    """Load checkpoint while allowing optional module key mismatches only."""
+    if hasattr(model, 'load_state_dict_compatible'):
+        missing, unexpected = model.load_state_dict_compatible(state_dict)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        disallowed_missing = [k for k in missing if not k.startswith(OPTIONAL_STATE_PREFIXES)]
+        disallowed_unexpected = [k for k in unexpected if not k.startswith(OPTIONAL_STATE_PREFIXES)]
+        if disallowed_missing or disallowed_unexpected:
+            raise RuntimeError(
+                "Checkpoint mismatch while loading TemporalRTDETR. "
+                f"missing(non-optional)={disallowed_missing[:8]}, "
+                f"unexpected(non-optional)={disallowed_unexpected[:8]}"
+            )
+    return missing, unexpected
+
+
+def _cfg_get(cfg: BaseConfig, key: str, default=None):
+    value = getattr(cfg, key, None)
+    if value is not None:
+        return value
+    yaml_cfg = getattr(cfg, 'yaml_cfg', {})
+    if isinstance(yaml_cfg, dict):
+        return yaml_cfg.get(key, default)
+    return default
+
+
+def _dataset_runtime_cfg(cfg: BaseConfig, name: str) -> Dict[str, object]:
+    yaml_cfg = getattr(cfg, 'yaml_cfg', {})
+    if not isinstance(yaml_cfg, dict):
+        return {}
+    dataset_cfg = yaml_cfg.get(name, {}).get('dataset', {})
+    if not isinstance(dataset_cfg, dict):
+        return {}
+    keys = ('root_dir', 'ann_file', 'max_frame_gap', 'pair_sampling_strategy', 'frame_stride')
+    return {k: dataset_cfg.get(k) for k in keys if k in dataset_cfg}
+
+
+def _phase1_runtime_cfg(
+    cfg: BaseConfig,
+    training_strategy: str,
+    lambda_non_key: float,
+    lambda_kd: float,
+    lambda_score: float,
+    reuse_match_indices: bool,
+    same_frame: bool,
+) -> Dict[str, object]:
+    yaml_cfg = getattr(cfg, 'yaml_cfg', {})
+    if not isinstance(yaml_cfg, dict):
+        yaml_cfg = {}
+    return {
+        'training_strategy': training_strategy,
+        'same_frame': same_frame,
+        'reuse_match_indices': reuse_match_indices,
+        'lambda_non_key': lambda_non_key,
+        'lambda_kd': lambda_kd,
+        'lambda_score': lambda_score,
+        'enable_ref_delta': yaml_cfg.get('enable_ref_delta', False),
+        'ref_delta_hidden_dim': yaml_cfg.get('ref_delta_hidden_dim', 128),
+        'ref_delta_scale': yaml_cfg.get('ref_delta_scale', 0.2),
+        'ref_delta_xy_scale': yaml_cfg.get('ref_delta_xy_scale', None),
+        'ref_delta_wh_scale': yaml_cfg.get('ref_delta_wh_scale', None),
+        'ref_delta_zero_init_last': yaml_cfg.get('ref_delta_zero_init_last', False),
+        'train_dataloader_dataset': _dataset_runtime_cfg(cfg, 'train_dataloader'),
+        'val_dataloader_dataset': _dataset_runtime_cfg(cfg, 'val_dataloader'),
+    }
+
+
 class Phase1Trainer:
     """
     Training Strategies:
@@ -135,7 +210,7 @@ class Phase1Trainer:
         self.same_frame = same_frame
         self.reuse_match_indices = reuse_match_indices
         self.provenance = provenance or {}
-        self.lambda_score = getattr(self.cfg, 'lambda_score', 15.0)
+        self.lambda_score = float(_cfg_get(self.cfg, 'lambda_score', 15.0))
         
         valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
@@ -146,10 +221,12 @@ class Phase1Trainer:
 
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.training_strategy in ['kd', 'joint']:
-               self.lambda_kd = getattr(self.cfg, 'lambda_kd', 150.0)
+               self.lambda_kd = float(_cfg_get(self.cfg, 'lambda_kd', 150.0))
                if self.training_strategy == 'kd' or self.lambda_kd > 0 or self.lambda_score > 0:
                    print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
                    print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
+        else:
+               self.lambda_kd = 0.0
 
         if self.same_frame:
             print("--same_frame is active.")
@@ -517,6 +594,15 @@ class Phase1Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'metrics': metrics,
             'provenance': self.provenance,
+            'run_config': _phase1_runtime_cfg(
+                cfg=self.cfg,
+                training_strategy=self.training_strategy,
+                lambda_non_key=self.lambda_non_key,
+                lambda_kd=self.lambda_kd,
+                lambda_score=self.lambda_score,
+                reuse_match_indices=self.reuse_match_indices,
+                same_frame=self.same_frame,
+            ),
         }
         
         map5095 = metrics.get('non_key_mAP', 0.0)
@@ -599,6 +685,13 @@ def build_model_from_config(config_path: str, device: torch.device):
         apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
         apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
         apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
+        enable_ref_delta=cfg.yaml_cfg.get('enable_ref_delta', False),
+        ref_delta_hidden_dim=cfg.yaml_cfg.get('ref_delta_hidden_dim', 128),
+        ref_delta_scale=cfg.yaml_cfg.get('ref_delta_scale', 0.2),
+        ref_delta_in_channels=cfg.yaml_cfg.get('ref_delta_in_channels', 512),
+        ref_delta_xy_scale=cfg.yaml_cfg.get('ref_delta_xy_scale', None),
+        ref_delta_wh_scale=cfg.yaml_cfg.get('ref_delta_wh_scale', None),
+        ref_delta_zero_init_last=cfg.yaml_cfg.get('ref_delta_zero_init_last', False),
     )
     
     return temporal_model, cfg
@@ -689,12 +782,19 @@ def main():
             print(f"   Source key-path fingerprint: {source_fp['sha256'][:16]} ({source_fp['matched_keys']} tensors)")
             
             if is_temporal:
-                print("   [Auto-Detect] Full Temporal weights found. Loading strictly...")
+                print("   [Auto-Detect] Full Temporal weights found. Loading with compatibility checks...")
                 has_non_key_prediction_heads = any(k.startswith(NON_KEY_HEAD_PREFIXES) for k in state_dict.keys())
                 if has_non_key_prediction_heads and hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
                     model.decouple_non_key_prediction_heads()
                     print("   [Safety] Decoupled non-key prediction heads before strict temporal load.")
-                model.load_state_dict(state_dict, strict=True)
+                missing, unexpected = _load_temporal_checkpoint_compatible(model, state_dict)
+                optional_missing = [k for k in missing if k.startswith(OPTIONAL_STATE_PREFIXES)]
+                optional_unexpected = [k for k in unexpected if k.startswith(OPTIONAL_STATE_PREFIXES)]
+                if optional_missing or optional_unexpected:
+                    print(
+                        "   [Compat] Optional module key mismatch accepted: "
+                        f"missing={len(optional_missing)}, unexpected={len(optional_unexpected)}"
+                    )
                 load_report = _compare_prefixed_state_dicts(
                     state_dict, model.state_dict(), KEY_PATH_PREFIXES
                 )
@@ -745,13 +845,13 @@ def main():
                     print("   ✅ Successfully copied perfectly trained heavy transformer layer!")
         
         # Get config values (with overrides)
-        epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
-        output_dir = args.output_dir if args.output_dir is not None else getattr(cfg, 'output_dir', 'output/phase1_virat')
-        seed = args.seed if args.seed is not None else getattr(cfg, 'seed', 42)
-        lambda_non_key = getattr(cfg, 'lambda_non_key', 0.5)
-        print_freq = getattr(cfg, 'print_freq', 50)
-        checkpoint_freq = getattr(cfg, 'checkpoint_freq', 5)
-        clip_max_norm = getattr(cfg, 'clip_max_norm', 0.1)
+        epochs = args.epochs if args.epochs is not None else int(_cfg_get(cfg, 'epoches', 50))
+        output_dir = args.output_dir if args.output_dir is not None else _cfg_get(cfg, 'output_dir', 'output/phase1_virat')
+        seed = args.seed if args.seed is not None else int(_cfg_get(cfg, 'seed', 42))
+        lambda_non_key = float(_cfg_get(cfg, 'lambda_non_key', 0.5))
+        print_freq = int(_cfg_get(cfg, 'print_freq', 50))
+        checkpoint_freq = int(_cfg_get(cfg, 'checkpoint_freq', 5))
+        clip_max_norm = float(_cfg_get(cfg, 'clip_max_norm', 0.1))
 
         if args.lambda_kd is not None:
             cfg.lambda_kd = args.lambda_kd
@@ -759,7 +859,7 @@ def main():
         if args.lambda_score is not None:
             cfg.lambda_score = args.lambda_score
 
-        summary_dir = getattr(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
+        summary_dir = _cfg_get(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
         writer = SummaryWriter(log_dir=summary_dir)
         print(f"  Summary dir:      {summary_dir}")
         
@@ -768,6 +868,8 @@ def main():
         print(f"  Training strategy: {args.training_strategy}")
         print(f"  Reuse match idx:  {args.reuse_match_indices}")
         print(f"  Lambda (non-key): {lambda_non_key}")
+        print(f"  Lambda KD:        {_cfg_get(cfg, 'lambda_kd', 150.0)}")
+        print(f"  Lambda score:     {_cfg_get(cfg, 'lambda_score', 15.0)}")
         print(f"  Output dir:       {output_dir}")
         print(f"  Seed:             {seed}")
         
@@ -808,7 +910,7 @@ def main():
     for name, param in model.named_parameters():
         if args.training_strategy == 'kd_only':
             # Train fusion blocks ONLY. 
-            if 'fusion_blocks' in name:
+            if 'fusion_blocks' in name or 'ref_delta_adapter' in name:
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -831,7 +933,12 @@ def main():
                     or 'lightweight_decoder.query_pos_head' in name
                 )
             )
-            if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name or train_prediction_modules:
+            if (
+                'fusion_blocks' in name
+                or 'lightweight_decoder.decoder' in name
+                or 'ref_delta_adapter' in name
+                or train_prediction_modules
+            ):
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -839,7 +946,12 @@ def main():
                 
         elif args.training_strategy == 'joint':
             # Train heavy decoder, fusion blocks, and light decoder.
-            if 'decoder.' in name or 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
+            if (
+                'decoder.' in name
+                or 'fusion_blocks' in name
+                or 'lightweight_decoder.decoder' in name
+                or 'ref_delta_adapter' in name
+            ):
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -855,7 +967,7 @@ def main():
         print(f"\nResuming from: {args.resume}")
         try:
             checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            _load_temporal_checkpoint_compatible(model, checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             print(f"Resumed from epoch {start_epoch}")

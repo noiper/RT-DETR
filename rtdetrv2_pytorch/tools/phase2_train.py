@@ -40,6 +40,13 @@ def _build_temporal_model(cfg: Any, device: torch.device) -> Any:
         apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
         apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
         apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
+        enable_ref_delta=cfg.yaml_cfg.get('enable_ref_delta', False),
+        ref_delta_hidden_dim=cfg.yaml_cfg.get('ref_delta_hidden_dim', 128),
+        ref_delta_scale=cfg.yaml_cfg.get('ref_delta_scale', 0.2),
+        ref_delta_in_channels=cfg.yaml_cfg.get('ref_delta_in_channels', 512),
+        ref_delta_xy_scale=cfg.yaml_cfg.get('ref_delta_xy_scale', None),
+        ref_delta_wh_scale=cfg.yaml_cfg.get('ref_delta_wh_scale', None),
+        ref_delta_zero_init_last=cfg.yaml_cfg.get('ref_delta_zero_init_last', False),
     ).to(device)
     return model
 
@@ -122,7 +129,10 @@ def _prepare_targets_for_loss(targets: List[Dict], device: torch.device) -> List
 def _load_tuning_weights(model: Any, tuning_path: str, device: torch.device) -> None:
     checkpoint = torch.load(tuning_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if hasattr(model, 'load_state_dict_compatible'):
+        missing, unexpected = model.load_state_dict_compatible(state_dict)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f'Loaded tuning weights from {tuning_path}')
     print(f'  Missing keys: {len(missing)}')
     print(f'  Unexpected keys: {len(unexpected)}')
@@ -686,7 +696,10 @@ def main():
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        if hasattr(model, 'load_state_dict_compatible'):
+            model.load_state_dict_compatible(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_loss = checkpoint.get('best_loss', float('inf'))
