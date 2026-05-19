@@ -165,17 +165,6 @@ def main():
         num_queries=300,
         use_lightweight_decoder=cfg.yaml_cfg.get('use_lightweight_decoder', True),
         reuse_position=cfg.yaml_cfg.get('reuse_position', 0),
-        enable_apg=cfg.yaml_cfg.get('enable_apg', False),
-        apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
-        apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
-        apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
-        enable_ref_delta=cfg.yaml_cfg.get('enable_ref_delta', False),
-        ref_delta_hidden_dim=cfg.yaml_cfg.get('ref_delta_hidden_dim', 128),
-        ref_delta_scale=cfg.yaml_cfg.get('ref_delta_scale', 0.2),
-        ref_delta_in_channels=cfg.yaml_cfg.get('ref_delta_in_channels', 512),
-        ref_delta_xy_scale=cfg.yaml_cfg.get('ref_delta_xy_scale', None),
-        ref_delta_wh_scale=cfg.yaml_cfg.get('ref_delta_wh_scale', None),
-        ref_delta_zero_init_last=cfg.yaml_cfg.get('ref_delta_zero_init_last', False),
     ).to(device)
 
     # 2. Load Weights
@@ -183,10 +172,7 @@ def main():
     state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
     if any('lightweight_decoder.dec_score_head' in k for k in state_dict.keys()):
         model.decouple_non_key_prediction_heads()
-    if hasattr(model, 'load_state_dict_compatible'):
-        model.load_state_dict_compatible(state_dict)
-    else:
-        model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     # 3. Setup Dataloader and Criterion

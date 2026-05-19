@@ -58,13 +58,6 @@ def _build_temporal_model(cfg: Any, device: torch.device) -> Any:
         apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
         apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
         apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
-        enable_ref_delta=cfg.yaml_cfg.get('enable_ref_delta', False),
-        ref_delta_hidden_dim=cfg.yaml_cfg.get('ref_delta_hidden_dim', 128),
-        ref_delta_scale=cfg.yaml_cfg.get('ref_delta_scale', 0.2),
-        ref_delta_in_channels=cfg.yaml_cfg.get('ref_delta_in_channels', 512),
-        ref_delta_xy_scale=cfg.yaml_cfg.get('ref_delta_xy_scale', None),
-        ref_delta_wh_scale=cfg.yaml_cfg.get('ref_delta_wh_scale', None),
-        ref_delta_zero_init_last=cfg.yaml_cfg.get('ref_delta_zero_init_last', False),
     ).to(device)
 
 
@@ -78,10 +71,7 @@ def _load_checkpoint(model: Any, ckpt_path: str, device: torch.device) -> None:
         print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
         model.decouple_non_key_prediction_heads()
 
-    if hasattr(model, 'load_state_dict_compatible'):
-        missing, unexpected = model.load_state_dict_compatible(state_dict)
-    else:
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f'Loaded checkpoint from {ckpt_path}')
     print(f'  Missing keys: {len(missing)}')
     print(f'  Unexpected keys: {len(unexpected)}')
