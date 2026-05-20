@@ -743,6 +743,14 @@ def main():
                     heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
                     model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
                     print("   ✅ Successfully copied perfectly trained heavy transformer layer!")
+
+        if hasattr(model, 'repair_dead_fusion_gates'):
+            repaired_blocks = model.repair_dead_fusion_gates()
+            if repaired_blocks:
+                print(
+                    "\n=> Repaired dead fusion residual gates in blocks "
+                    f"{repaired_blocks}: final BN scale was zero while final conv was zero."
+                )
         
         # Get config values (with overrides)
         epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
@@ -845,9 +853,11 @@ def main():
             else:
                 param.requires_grad = False
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
+    train_lr = args.lr if args.lr is not None else 1e-4
+    optimizer = torch.optim.AdamW(trainable_params, lr=train_lr, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     print(f"   Registered {len(trainable_params)} parameter tensors to Optimizer.")
+    print(f"   Optimizer LR: {train_lr}")
     
     # Resume
     start_epoch = 0

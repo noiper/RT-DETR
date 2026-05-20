@@ -32,9 +32,11 @@ class TemporalFusionBlock(nn.Module):
             nn.BatchNorm2d(hidden_dim)
         )
 
-        # Initialize the final Conv2d and BatchNorm to output exactly 0.0
+        # Start as an exact residual path while keeping gradients alive.
+        # With both final conv weight and final BN scale set to zero, the
+        # current-frame branch is a dead gate: only the BN bias can learn.
         nn.init.constant_(self.fusion[3].weight, 0.0)
-        nn.init.constant_(self.fusion[4].weight, 0.0)
+        nn.init.constant_(self.fusion[4].weight, 1.0)
         nn.init.constant_(self.fusion[4].bias, 0.0)
         
     def forward(self, s_feat: torch.Tensor, ccff_feat: torch.Tensor) -> torch.Tensor:
@@ -440,6 +442,25 @@ class TemporalRTDETR(nn.Module):
         if not self.use_lightweight_decoder or self.lightweight_decoder is None:
             raise RuntimeError("Lightweight decoder is required to decouple non-key prediction modules")
         self.lightweight_decoder.decouple_prediction_modules()
+
+    def repair_dead_fusion_gates(self) -> List[int]:
+        """
+        Repair checkpoints trained with zero final fusion conv and zero final BN scale.
+
+        Returns:
+            repaired_blocks: Fusion block indices that were repaired.
+        """
+        repaired_blocks = []
+        with torch.no_grad():
+            for idx, block in enumerate(self.fusion_blocks):
+                final_conv = block.fusion[3]
+                final_bn = block.fusion[4]
+                conv_dead = torch.count_nonzero(final_conv.weight).item() == 0
+                bn_dead = torch.count_nonzero(final_bn.weight).item() == 0
+                if conv_dead and bn_dead:
+                    final_bn.weight.fill_(1.0)
+                    repaired_blocks.append(idx)
+        return repaired_blocks
 
 
 def build_temporal_rtdetr(cfg):
