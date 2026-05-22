@@ -75,7 +75,7 @@ def main(args):
     if not is_temporal_ckpt:
         raise RuntimeError(
             "Checkpoint does not look like a full temporal checkpoint (missing fusion/lightweight decoder keys). "
-            "Please pass a phase1 temporal checkpoint, e.g. output/phase1_*/best_model.pth."
+            "Please pass a full temporal checkpoint with fusion/lightweight decoder keys."
         )
 
     model = _build_temporal_model(cfg)

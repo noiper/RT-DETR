@@ -1,5 +1,5 @@
 """
-Real-Time Temporal Inference Simulator
+Temporal Stream Inference Simulator
 Simulates a live continuous streaming environment with configurable K-NK ratios.
 Tracks Latency, Peak VRAM Memory Allocation, and Combined COCO mAP.
 """
@@ -8,8 +8,6 @@ import os
 import sys
 import time
 import argparse
-import contextlib
-import io
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -20,8 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from src.core import YAMLConfig
 from src.zoo.temporal_rtdetr import TemporalRTDETR
 from src.zoo.rtdetr.box_ops import box_iou, box_cxcywh_to_xyxy
-from pycocotools.cocoeval import COCOeval
-from typing import Dict
+from temporal_eval_utils import _extract_total_loss, evaluate_map, parse_scale_grid, scale_results
 
 def record_stats(results, target, iou_list, conf_list, score_thr, device, actual_size):
     """
@@ -127,90 +124,13 @@ def format_coco(targets, outputs, results_list):
                 "score": float(scores[i])
             })
 
-def propagate_key_results_to_non_key_targets(key_results, non_key_targets):
-    """
-    Reuse key-frame detections directly as non-key predictions.
-    Keeps boxes/scores/labels and only changes destination image IDs via format_coco.
-    """
-    propagated = []
-    for output in key_results:
-        propagated.append({
-            'boxes': output['boxes'].clone(),
-            'scores': output['scores'].clone(),
-            'labels': output['labels'].clone(),
-        })
-    if len(propagated) != len(non_key_targets):
-        raise RuntimeError(
-            f"Batch size mismatch for propagation: key={len(propagated)} vs non-key={len(non_key_targets)}"
-        )
-    return propagated
-
-def scale_results(results, score_scale):
-    if score_scale == 1.0:
-        return results
-    scaled = []
-    for det in results:
-        score = float(det['score']) * score_scale
-        out = det.copy()
-        out['score'] = score
-        scaled.append(out)
-    return scaled
-
-def parse_scale_grid(grid_text):
-    values = []
-    for token in grid_text.split(','):
-        token = token.strip()
-        if not token:
-            continue
-        values.append(float(token))
-    if not values:
-        raise ValueError("score scale grid cannot be empty")
-    return values
-
-def evaluate_map(coco_gt, results, title, img_ids=None):
-    """Runs pycocotools evaluation and returns all 12 COCO stats."""
-    if not results and not img_ids:
-        return np.zeros(12)
-        
-    if not results:
-        coco_dt = coco_gt.loadRes([])
-    else:
-        coco_dt = coco_gt.loadRes(results)
-        
-    evaluator = COCOeval(coco_gt, coco_dt, 'bbox')
-    
-    # STRICTLY LIMIT EVALUATION TO THE IMAGES PREDICTED
-    # Prevents artificial deflation when evaluating partial streams
-    if img_ids is not None:
-        evaluator.params.imgIds = sorted(list(img_ids))
-    else:
-        predicted_img_ids = sorted(list(set([res['image_id'] for res in results])))
-        evaluator.params.imgIds = predicted_img_ids
-    
-    evaluator.evaluate()
-    evaluator.accumulate()
-    # COCOeval fills `stats` during summarize(); silence the default table output.
-    with contextlib.redirect_stdout(io.StringIO()):
-        evaluator.summarize()
-    
-    if len(evaluator.stats) < 12:
-        return np.zeros(12)
-    return evaluator.stats
-
 def extract_video_id(file_name):
-    """Extract video ID from filename (matches ViratTemporalDataset logic)"""
+    """Extract video ID from filename (matches TemporalVideoDataset logic)"""
     import os
     parts = os.path.normpath(file_name).split(os.sep)
     if len(parts) > 1:
         return parts[0]
     return "default_video"
-
-def _extract_total_loss(loss_dict: Dict[str, torch.Tensor]) -> float:
-    """Extracts main detection loss, ignoring auxiliary and denoising."""
-    relevant_keys = [k for k in loss_dict.keys() if not any(x in k for x in ['_aux_', '_dn_', '_enc_'])]
-    if not relevant_keys:
-        return 0.0
-    return sum(loss_dict[k] for k in relevant_keys).item()
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in Real-Time Simulation")
@@ -322,6 +242,7 @@ def main():
     eval_img_ids_key = set()
     eval_img_ids_nk = set()
     latest_key_results = None
+    latest_key_results_norm = None
     latest_key_outputs = None
 
     # Diagnostic Stats
@@ -401,6 +322,9 @@ def main():
                 
                 orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
                 latest_key_results = postprocessor(out_k, orig_sizes_k)
+                if args.baseline:
+                    norm_sizes_k = torch.ones_like(orig_sizes_k, device=device)
+                    latest_key_results_norm = postprocessor(out_k, norm_sizes_k)
                 record_stats(latest_key_results[0], target_key, key_ious, key_confs, args.score_thr, device, orig_sizes_k)
                 record_tp_fp_stats(latest_key_results[0], target_key, key_tp_scores, key_fp_scores, args.score_thr, device, orig_sizes_k)
                 format_coco(target_key, latest_key_results, res_key)
@@ -417,10 +341,17 @@ def main():
             if img_non_key is not None and len(img_non_key) > 0:
                 target_non_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
                 if args.baseline:
-                    if latest_key_results is None:
+                    if latest_key_results_norm is None:
                         raise RuntimeError("No cached key results available for non-key propagation")
                     t2 = time.perf_counter()
-                    res_nk_batch = propagate_key_results_to_non_key_targets(latest_key_results, target_non_key)
+                    res_nk_batch = []
+                    for key_result_norm, target in zip(latest_key_results_norm, target_non_key):
+                        current_size = target["orig_size"].to(device).repeat(2)
+                        res_nk_batch.append({
+                            'boxes': key_result_norm['boxes'] * current_size,
+                            'scores': key_result_norm['scores'],
+                            'labels': key_result_norm['labels'],
+                        })
                     t3 = time.perf_counter()
                     if i >= args.warmup and latest_key_outputs is not None:
                         loss_dict = criterion(latest_key_outputs, target_non_key)
@@ -495,9 +426,7 @@ def main():
             # Filter out overlapping image IDs from non-key results
             filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
             
-            stats_tmp = evaluate_map(
-                coco_gt, res_key + filtered_nk, "COMBINED OVERALL AVERAGE", combined_img_ids
-            )
+            stats_tmp = evaluate_map(coco_gt, res_key + filtered_nk, combined_img_ids)
             score = (stats_tmp[1], stats_tmp[0]) # (mAP50, mAP)
             if best is None or score > best['score']:
                 best = {
@@ -513,9 +442,9 @@ def main():
     final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in eval_img_ids_key]
     scaled_combined = res_key + final_filtered_nk
 
-    stats_k = evaluate_map(coco_gt, res_key, "HEAVY KEY MODEL ONLY", eval_img_ids_key)
-    stats_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY", eval_img_ids_nk)
-    stats_combined = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
+    stats_k = evaluate_map(coco_gt, res_key, eval_img_ids_key)
+    stats_nk = evaluate_map(coco_gt, scaled_res_nk, eval_img_ids_nk)
+    stats_combined = evaluate_map(coco_gt, scaled_combined, combined_img_ids)
 
     print("\n" + "="*70)
     print(f"FINAL SUMMARY (Level {args.nk_per_key} | Stride {cycle_len})")

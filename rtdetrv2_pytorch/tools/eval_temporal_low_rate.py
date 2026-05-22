@@ -1,6 +1,6 @@
 """
-Real-Time Temporal Inference Simulator
-Simulates a live continuous streaming environment with configurable K-NK ratios.
+Temporal Low-Rate Inference Simulator
+Simulates reduced incoming image rate with alternating Key/Non-Key predictions.
 Tracks Latency, Peak VRAM Memory Allocation, and Combined COCO mAP.
 """
 
@@ -8,8 +8,6 @@ import os
 import sys
 import time
 import argparse
-import contextlib
-import io
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -20,8 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from src.core import YAMLConfig
 from src.zoo.temporal_rtdetr import TemporalRTDETR
 from src.zoo.rtdetr.box_ops import box_iou, box_cxcywh_to_xyxy
-from pycocotools.cocoeval import COCOeval
-from typing import Dict
+from temporal_eval_utils import _extract_total_loss, evaluate_map, parse_scale_grid, scale_results
 
 def record_stats(results, target, iou_list, conf_list, score_thr, device, actual_size):
     """
@@ -116,7 +113,7 @@ def record_tp_fp_stats(results, target, tp_scores_list, fp_scores_list, score_th
                     best_iou = iou
                     best_gt_idx = g_idx
         
-        if best_iou >= iou_thr and not matched_gt[best_gt_idx]:
+        if best_iou >= iou_thr and best_gt_idx >= 0 and not matched_gt[best_gt_idx]:
             tp_scores_list.append(float(pred_scores_np[idx]))
             matched_gt[best_gt_idx] = True
         else:
@@ -158,72 +155,13 @@ def format_coco(targets, outputs, results_list):
                 "score": float(scores[i])
             })
 
-def scale_results(results, score_scale):
-    if score_scale == 1.0:
-        return results
-    scaled = []
-    for det in results:
-        score = float(det['score']) * score_scale
-        out = det.copy()
-        out['score'] = score
-        scaled.append(out)
-    return scaled
-
-def parse_scale_grid(grid_text):
-    values = []
-    for token in grid_text.split(','):
-        token = token.strip()
-        if not token:
-            continue
-        values.append(float(token))
-    if not values:
-        raise ValueError("score scale grid cannot be empty")
-    return values
-
-def evaluate_map(coco_gt, results, title, img_ids=None):
-    """Runs pycocotools evaluation and returns all 12 COCO stats."""
-    if not results and not img_ids:
-        return np.zeros(12)
-        
-    if not results:
-        coco_dt = coco_gt.loadRes([])
-    else:
-        coco_dt = coco_gt.loadRes(results)
-        
-    evaluator = COCOeval(coco_gt, coco_dt, 'bbox')
-    
-    # STRICTLY LIMIT EVALUATION TO THE IMAGES PREDICTED
-    # Prevents artificial deflation when evaluating partial streams
-    if img_ids is not None:
-        evaluator.params.imgIds = sorted(list(img_ids))
-    else:
-        predicted_img_ids = sorted(list(set([res['image_id'] for res in results])))
-        evaluator.params.imgIds = predicted_img_ids
-    
-    evaluator.evaluate()
-    evaluator.accumulate()
-    # COCOeval fills `stats` during summarize(); silence the default table output.
-    with contextlib.redirect_stdout(io.StringIO()):
-        evaluator.summarize()
-    
-    if len(evaluator.stats) < 12:
-        return np.zeros(12)
-    return evaluator.stats
-
 def extract_video_id(file_name):
-    """Extract video ID from filename (matches ViratTemporalDataset logic)"""
+    """Extract video ID from filename (matches TemporalVideoDataset logic)"""
     import os
     parts = os.path.normpath(file_name).split(os.sep)
     if len(parts) > 1:
         return parts[0]
     return "default_video"
-
-def _extract_total_loss(loss_dict: Dict[str, torch.Tensor]) -> float:
-    """Extracts main detection loss, ignoring auxiliary and denoising."""
-    relevant_keys = [k for k in loss_dict.keys() if not any(x in k for x in ['_aux_', '_dn_', '_enc_'])]
-    if not relevant_keys:
-        return 0.0
-    return sum(loss_dict[k] for k in relevant_keys).item()
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in Real-Time Simulation")
@@ -531,9 +469,7 @@ def main():
             # Filter out overlapping image IDs from non-key results
             filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
             
-            stats_tmp = evaluate_map(
-                coco_gt, res_key + filtered_nk, "COMBINED OVERALL AVERAGE", combined_img_ids
-            )
+            stats_tmp = evaluate_map(coco_gt, res_key + filtered_nk, combined_img_ids)
             score = (stats_tmp[1], stats_tmp[0]) # (mAP50, mAP)
             if best is None or score > best['score']:
                 best = {
@@ -549,9 +485,9 @@ def main():
     final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in eval_img_ids_key]
     scaled_combined = res_key + final_filtered_nk
 
-    stats_k = evaluate_map(coco_gt, res_key, "HEAVY KEY MODEL ONLY", eval_img_ids_key)
-    stats_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY", eval_img_ids_nk)
-    stats_combined = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
+    stats_k = evaluate_map(coco_gt, res_key, eval_img_ids_key)
+    stats_nk = evaluate_map(coco_gt, scaled_res_nk, eval_img_ids_nk)
+    stats_combined = evaluate_map(coco_gt, scaled_combined, combined_img_ids)
 
     print("\n" + "="*70)
     print(f"FINAL SUMMARY (Skip: {args.skip})")
@@ -573,16 +509,20 @@ def main():
             print(f"Speedup (Key/Non-Key): {avg_k_time / avg_nk_time:.2f}x")
     print("="*70)
 
+    def safe_mean(values):
+        return float(np.mean(values)) if values else 0.0
+
     # Diagnostics Summary
     print("\n" + "="*70)
     print("DIAGNOSTICS SUMMARY")
     print("="*70)
-    print(f"  Key Path:  Avg IoU: {np.mean(key_ious):.4f} | Avg Conf: {np.mean(key_confs):.4f}")
-    print(f"  NK Path:   Avg IoU: {np.mean(nk_ious):.4f} | Avg Conf: {np.mean(nk_confs):.4f}")
+    print(f"  Key Path:  Avg IoU: {safe_mean(key_ious):.4f} | Avg Conf: {safe_mean(key_confs):.4f}")
+    print(f"  NK Path:   Avg IoU: {safe_mean(nk_ious):.4f} | Avg Conf: {safe_mean(nk_confs):.4f}")
     
     def get_sep(tp, fp):
-        if not tp or not fp: return 0.0
-        return np.mean(tp) - np.mean(fp)
+        if not tp or not fp:
+            return 0.0
+        return float(np.mean(tp) - np.mean(fp))
 
     print(f"\nTP/FP Score Separation (mean_tp - mean_fp):")
     print(f"  Key Path:  {get_sep(key_tp_scores, key_fp_scores):.4f}")
@@ -590,9 +530,9 @@ def main():
     
     print(f"\nDetailed Loss Analysis (Raw Criterion Values):")
     if loss_stats['key']['class']:
-        print(f"  Key Loss:  Class: {np.mean(loss_stats['key']['class']):.4f} | Box: {np.mean(loss_stats['key']['box']):.4f}")
+        print(f"  Key Loss:  Class: {safe_mean(loss_stats['key']['class']):.4f} | Box: {safe_mean(loss_stats['key']['box']):.4f}")
     if loss_stats['nk']['class']:
-        print(f"  NK Loss:   Class: {np.mean(loss_stats['nk']['class']):.4f} | Box: {np.mean(loss_stats['nk']['box']):.4f}")
+        print(f"  NK Loss:   Class: {safe_mean(loss_stats['nk']['class']):.4f} | Box: {safe_mean(loss_stats['nk']['box']):.4f}")
     print("="*70)
 
 if __name__ == '__main__':

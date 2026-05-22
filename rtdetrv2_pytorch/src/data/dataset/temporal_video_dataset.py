@@ -1,27 +1,24 @@
 """
-Temporal Video Dataset for Phase 1 Training
+Temporal video dataset for temporal RT-DETR training.
 Samples frame pairs (f_t, f_{t+s}) from video sequences
-TODO: move this file to dataset folder
 """
 
-import os
 import random
-import json
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import numpy as np
 
-from src.core import register
-from ...data._misc import convert_to_tv_tensor
+from ...core import register
+from .._misc import convert_to_tv_tensor
 from pycocotools.coco import COCO
 
 @register()
-class ViratTemporalDataset(Dataset):
+class TemporalVideoDataset(Dataset):
     """
-    VIRAT dataset for temporal RT-DETR Phase 1 training
+    Temporal video dataset for RT-DETR temporal training.
     Loads frame pairs for key/non-key frame training
     Returns pairs as: (image_key, target_key, image_non_key, target_non_key)
     """
@@ -38,7 +35,7 @@ class ViratTemporalDataset(Dataset):
     ):
         """
         Args:
-            root_dir: Root directory of VIRAT dataset
+            root_dir: Root directory containing video frames
             ann_file: Path to COCO-format annotation file
             transforms: Image transformations (can be dict or callable)
             max_frame_gap: Maximum frame gap 's' for sampling (1 to max_frame_gap)
@@ -65,7 +62,7 @@ class ViratTemporalDataset(Dataset):
         
         self.samples = self._build_sample_pairs()
         
-        print(f"Loaded {len(self.samples)} 'frame pairs from VIRAT dataset")
+        print(f"Loaded {len(self.samples)} frame pairs from temporal video dataset")
         print(f"  Max frame gap: {self.max_frame_gap}")
         print(f"  Sampling strategy: {self.pair_sampling_strategy}")
         print(f"  Frame stride: {self.frame_stride}")
@@ -178,15 +175,6 @@ class ViratTemporalDataset(Dataset):
         if not img_path.exists():
             raise FileNotFoundError(f"Image not found: {img_path}")
         return Image.open(img_path).convert('RGB')
-    
-    def _get_annotations(self, filename: str) -> List[Dict]:
-        """Get annotations for an image"""
-        # anns = []
-        # for ann in self.virat_data['annotations']:
-        #     if ann['image_id'] == img_id:
-        #         anns.append(ann)
-        # return anns
-        return self.filename_to_anns.get(filename, [])
     
     def _prepare_target(self, anns: List[Dict], img_info: Dict) -> Dict:
         """Prepare target dictionary from annotations"""

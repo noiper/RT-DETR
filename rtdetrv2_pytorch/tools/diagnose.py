@@ -1,322 +1,302 @@
+import argparse
 import os
 import sys
-import argparse
-import torch
-import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from typing import List, Dict
+from collections import defaultdict
+from typing import Dict, Iterable, List, Tuple
 
-# Ensure python path is correct
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import numpy as np
+import torch
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from src.core import YAMLConfig
+from src.zoo.rtdetr.box_ops import box_cxcywh_to_xyxy, box_iou
 from src.zoo.temporal_rtdetr import TemporalRTDETR
-from src.zoo.rtdetr.box_ops import box_iou, box_cxcywh_to_xyxy
 
-def record_stats(results, target, iou_list, conf_list, score_thr, device, actual_size):
-    """
-    results: dict from postprocessor with 'boxes' (absolute xyxy)
-    target: list containing a dict with 'boxes' (GT)
-    actual_size: tensor of shape [1, 2] containing [W, H] of the image tensor
-    """
-    # filter by score
-    keep = results['scores'] > score_thr
-    pred_boxes = results['boxes'][keep] # [M, 4] xyxy
-    pred_scores = results['scores'][keep]
-    
-    # get GT boxes
-    gt_boxes_raw = target[0]['boxes'] # [N, 4]
-    if gt_boxes_raw.numel() == 0:
-        return
-        
-    w, h = actual_size[0, 0], actual_size[0, 1]
-    
-    # Handle GT Boxes conversion to absolute xyxy in the 640 space (actual_size)
-    is_normalized = (gt_boxes_raw <= 1.01).all()
-    if is_normalized:
-        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
-        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
-    else:
-        gt_boxes_xyxy = gt_boxes_raw.to(device)
 
-    if pred_boxes.numel() == 0:
-        iou_list.extend([0.0] * gt_boxes_xyxy.shape[0])
-        conf_list.extend([0.0] * gt_boxes_xyxy.shape[0])
-    else:
-        # Pairwise IoU: [N_gt, M_pred]
-        ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
-        # Best IoU per GT
-        best_iou_vals, best_indices = ious.max(dim=1)
-        iou_list.extend(best_iou_vals.cpu().numpy().tolist())
-        
-        # Confidence of matched predictions
-        matched_confs = pred_scores[best_indices].cpu().numpy()
-        conf_list.extend(matched_confs.tolist())
-
-def record_tp_fp_stats(results, target, tp_scores_list, fp_scores_list, score_thr, device, actual_size, iou_thr=0.5):
-    """
-    results: dict from postprocessor with 'boxes' (absolute xyxy)
-    target: list containing a dict with 'boxes' (GT)
-    """
-    keep = results['scores'] > score_thr
-    pred_boxes = results['boxes'][keep]
-    pred_scores = results['scores'][keep]
-    pred_labels = results['labels'][keep]
-    
-    gt_boxes_raw = target[0]['boxes']
-    gt_labels = target[0]['labels']
-    
-    if pred_boxes.numel() == 0:
-        return
-
-    if gt_boxes_raw.numel() == 0:
-        fp_scores_list.extend(pred_scores.cpu().numpy().tolist())
-        return
-
-    w, h = actual_size[0, 0], actual_size[0, 1]
-    is_normalized = (gt_boxes_raw <= 1.01).all()
-    if is_normalized:
-        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
-        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
-    else:
-        gt_boxes_xyxy = gt_boxes_raw.to(device)
-
-    # [N_gt, M_pred]
-    ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
-    
-    # --- Move to CPU once to avoid synchronization bottleneck ---
-    pred_scores_np = pred_scores.cpu().numpy()
-    pred_labels_np = pred_labels.cpu().numpy()
-    gt_labels_np = gt_labels.numpy()
-    ious_np = ious.cpu().numpy()
-    
-    # Sort predictions by score descending
-    indices = np.argsort(-pred_scores_np)
-    matched_gt = np.zeros(gt_boxes_xyxy.shape[0], dtype=bool)
-    
-    for idx in indices:
-        label = pred_labels_np[idx]
-        best_iou = -1
-        best_gt_idx = -1
-        
-        for g_idx in range(gt_boxes_xyxy.shape[0]):
-            if gt_labels_np[g_idx] == label:
-                iou = ious_np[g_idx, idx]
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = g_idx
-        
-        if best_iou >= iou_thr and not matched_gt[best_gt_idx]:
-            tp_scores_list.append(float(pred_scores_np[idx]))
-            matched_gt[best_gt_idx] = True
-        else:
-            fp_scores_list.append(float(pred_scores_np[idx]))
-
-def extract_video_id(file_name):
-    parts = os.path.normpath(file_name).split(os.sep)
-    return parts[0] if len(parts) > 1 else "default_video"
-
-def prepare_targets_for_loss(targets, device):
-    """
-    Criterion expects normalized cxcywh boxes in target['boxes']
-    """
-    new_targets = []
-    for t in targets:
-        nt = {k: v.to(device) for k, v in t.items()}
-        # Standardize boxes to normalized cxcywh if they aren't already
-        boxes = nt['boxes']
-        is_normalized = (boxes <= 1.01).all()
-        if not is_normalized:
-            w, h = nt['orig_size'][0], nt['orig_size'][1]
-            # Convert xyxy -> normalized cxcywh
-            # Note: This is a bit tricky since we don't know the exact transform history,
-            # but usually 'boxes' in target are absolute xyxy if ConvertBoxes(normalize=True) was skipped.
-            # We use orig_size because that's what's typically in the dict.
-            boxes[:, 2:] -= boxes[:, :2] # xyxy -> xywh
-            boxes[:, :2] += boxes[:, 2:] / 2 # xywh -> cxcywh
-            boxes /= torch.tensor([w, h, w, h], device=device)
-            nt['boxes'] = boxes
-        new_targets.append(nt)
-    return new_targets
-
-def main():
-    parser = argparse.ArgumentParser(description="Diagnose IoU Distribution for Key vs Non-Key Paths")
-    parser.add_argument('--config', '-c', type=str, required=True)
-    parser.add_argument('--weights', '-w', type=str, required=True)
-    parser.add_argument('--nk_per_key', '-n', type=int, default=1)
-    parser.add_argument('--score_thr', '-t', type=float, default=0.3)
-    parser.add_argument('--output', '-o', type=str, default='plots/iou_histogram.png')
-    parser.add_argument('--baseline', action='store_true')
-    args = parser.parse_args()
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfg = YAMLConfig(args.config)
-    
-    # 1. Build Model
+def build_model(cfg: YAMLConfig, weights: str, device: torch.device) -> TemporalRTDETR:
     base_model = cfg.model.to(device)
+
+    hidden_dim = 256
+    num_queries = 300
+    decoder_cfg = cfg.yaml_cfg.get("RTDETRTransformerv2") or cfg.yaml_cfg.get("RTDETRTransformer") or {}
+    hidden_dim = decoder_cfg.get("hidden_dim", hidden_dim)
+    num_queries = decoder_cfg.get("num_queries", num_queries)
+
     model = TemporalRTDETR(
         backbone=base_model.backbone,
-        encoder=getattr(base_model, 'encoder', None),
-        decoder=getattr(base_model, 'decoder', None),
-        num_classes=cfg.yaml_cfg.get('num_classes', 80),
-        hidden_dim=256,
-        num_queries=300,
-        use_lightweight_decoder=cfg.yaml_cfg.get('use_lightweight_decoder', True),
-        reuse_position=cfg.yaml_cfg.get('reuse_position', 0),
+        encoder=getattr(base_model, "encoder", None),
+        decoder=getattr(base_model, "decoder", None),
+        num_classes=cfg.yaml_cfg.get("num_classes", 80),
+        hidden_dim=hidden_dim,
+        num_queries=num_queries,
+        use_lightweight_decoder=cfg.yaml_cfg.get("use_lightweight_decoder", True),
+        reuse_position=cfg.yaml_cfg.get("reuse_position", 0),
     ).to(device)
 
-    # 2. Load Weights
-    checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
-    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
-    if any('lightweight_decoder.dec_score_head' in k for k in state_dict.keys()):
+    checkpoint = torch.load(weights, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
+    if any("lightweight_decoder.dec_score_head" in k for k in state_dict.keys()):
+        print("Auto-detected decoupled non-key prediction heads.")
         model.decouple_non_key_prediction_heads()
     model.load_state_dict(state_dict, strict=True)
     model.eval()
+    return model
 
-    # 3. Setup Dataloader and Criterion
+
+def rebuild_loader(cfg: YAMLConfig, batch_size: int, gap: int, frame_stride: int, num_workers: int):
+    if "val_dataloader" in cfg.yaml_cfg:
+        cfg.yaml_cfg["val_dataloader"]["batch_size"] = batch_size
+        cfg.yaml_cfg["val_dataloader"]["drop_last"] = False
+        dataset_cfg = cfg.yaml_cfg["val_dataloader"].get("dataset", {})
+        dataset_cfg["max_frame_gap"] = gap
+        dataset_cfg["frame_stride"] = frame_stride
+        dataset_cfg["pair_sampling_strategy"] = "fixed_gap"
+
+    base_loader = cfg.val_dataloader
     from torch.utils.data import DataLoader
-    base_val_loader = cfg.val_dataloader
-    val_dataloader = DataLoader(
-        dataset=base_val_loader.dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=base_val_loader.num_workers,
-        collate_fn=base_val_loader.collate_fn,
-        drop_last=False
-    )
-    postprocessor = cfg.postprocessor
-    criterion = cfg.criterion.to(device)
-    criterion.eval()
 
-    key_ious, nk_ious = [], []
-    key_confs, nk_confs = [], []
-    key_tp_scores, key_fp_scores = [], []
-    nk_tp_scores, nk_fp_scores = [], []
-    
-    # Loss tracking
-    loss_stats = {
-        'key': {'class': [], 'box': []},
-        'nk':  {'class': [], 'box': []}
+    return DataLoader(
+        dataset=base_loader.dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=base_loader.collate_fn,
+        drop_last=False,
+    )
+
+
+def result_to_arrays(result: Dict[str, torch.Tensor], score_thr: float):
+    keep = result["scores"] >= score_thr
+    return {
+        "boxes": result["boxes"][keep],
+        "scores": result["scores"][keep],
+        "labels": result["labels"][keep],
     }
 
-    last_video_id = None
-    nk_counter = 0
-    last_key_results_norm = None
 
-    mode_str = "BASELINE" if args.baseline else "MODEL"
-    print(f"Starting Diagnostic ({mode_str})...")
-    
+def normalized_key_result(postprocessor, out_key: Dict[str, torch.Tensor]):
+    norm_size = torch.tensor([[1.0, 1.0]], device=out_key["pred_boxes"].device)
+    return postprocessor(out_key, norm_size)[0]
+
+
+def reuse_result_to_size(key_norm: Dict[str, torch.Tensor], target: Dict[str, torch.Tensor]):
+    orig_size = target["orig_size"].to(key_norm["boxes"].device)
+    return {
+        "boxes": key_norm["boxes"] * orig_size.repeat(2),
+        "scores": key_norm["scores"],
+        "labels": key_norm["labels"],
+    }
+
+
+def pred_similarity(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor], score_thr: float) -> Dict[str, float]:
+    a = result_to_arrays(a, score_thr)
+    b = result_to_arrays(b, score_thr)
+    if a["boxes"].numel() == 0:
+        return {"count": 0.0}
+    if b["boxes"].numel() == 0:
+        return {"count": float(a["boxes"].shape[0]), "mean_best_iou": 0.0, "matched_50": 0.0}
+
+    ious, _ = box_iou(a["boxes"], b["boxes"])
+    same_label = a["labels"][:, None] == b["labels"][None, :]
+    ious = torch.where(same_label, ious, torch.zeros_like(ious))
+    best_iou, best_idx = ious.max(dim=1)
+
+    score_delta = b["scores"][best_idx] - a["scores"]
+    return {
+        "count": float(a["boxes"].shape[0]),
+        "mean_best_iou": float(best_iou.mean().item()),
+        "matched_50": float((best_iou >= 0.50).float().mean().item()),
+        "matched_75": float((best_iou >= 0.75).float().mean().item()),
+        "score_delta": float(score_delta.mean().item()),
+    }
+
+
+def cxcywh_deltas(a_boxes: torch.Tensor, b_boxes: torch.Tensor, topk: int, scores: torch.Tensor) -> Dict[str, float]:
+    if a_boxes.numel() == 0:
+        return {}
+    k = min(topk, a_boxes.shape[1])
+    query_ids = scores.topk(k, dim=1).indices
+    batch_ids = torch.arange(a_boxes.shape[0], device=a_boxes.device)[:, None]
+    a = a_boxes[batch_ids, query_ids]
+    b = b_boxes[batch_ids, query_ids]
+    center_delta = (b[..., :2] - a[..., :2]).norm(dim=-1)
+    wh_a = a[..., 2:].clamp_min(1e-6)
+    wh_b = b[..., 2:].clamp_min(1e-6)
+    log_scale = (wh_b.prod(dim=-1) / wh_a.prod(dim=-1)).log().abs()
+    return {
+        "query_center_delta": float(center_delta.mean().item()),
+        "query_center_delta_p90": float(torch.quantile(center_delta.flatten(), 0.9).item()),
+        "query_moved_gt_001": float((center_delta > 0.01).float().mean().item()),
+        "query_moved_gt_003": float((center_delta > 0.03).float().mean().item()),
+        "query_abs_log_area": float(log_scale.mean().item()),
+    }
+
+
+def feature_stats(cached: torch.Tensor, fused: torch.Tensor, teacher: torch.Tensor) -> Dict[str, float]:
+    # Feature tensors are [batch, channels, height, width].
+    cached_f = cached.float()
+    fused_f = fused.float()
+    teacher_f = teacher.float()
+
+    raw_key_gap = (teacher_f - cached_f).pow(2).mean().sqrt()
+    raw_fused_gap = (teacher_f - fused_f).pow(2).mean().sqrt()
+    raw_fused_move = (fused_f - cached_f).pow(2).mean().sqrt()
+    teacher_norm = teacher_f.pow(2).mean().sqrt().clamp_min(1e-9)
+    key_gap = raw_key_gap / teacher_norm
+    fused_gap = raw_fused_gap / teacher_norm
+    fused_move = raw_fused_move / teacher_norm
+
+    cached_flat = cached_f.flatten(1)
+    fused_flat = fused_f.flatten(1)
+    teacher_flat = teacher_f.flatten(1)
+    cos_cached = torch.nn.functional.cosine_similarity(cached_flat, teacher_flat, dim=1).mean()
+    cos_fused = torch.nn.functional.cosine_similarity(fused_flat, teacher_flat, dim=1).mean()
+    improvement = (key_gap - fused_gap) / key_gap.clamp_min(1e-9)
+
+    return {
+        "teacher_gap_cached": float(key_gap.item()),
+        "teacher_gap_fused": float(fused_gap.item()),
+        "fused_move_from_cached": float(fused_move.item()),
+        "gap_reduction": float(improvement.item()),
+        "cos_cached_teacher": float(cos_cached.item()),
+        "cos_fused_teacher": float(cos_fused.item()),
+    }
+
+
+def update_sum(bucket: Dict[str, List[float]], prefix: str, values: Dict[str, float]):
+    for key, value in values.items():
+        bucket[f"{prefix}/{key}"].append(value)
+
+
+def mean(bucket: Dict[str, List[float]], key: str) -> float:
+    values = bucket.get(key, [])
+    return float(np.mean(values)) if values else 0.0
+
+
+def print_table(title: str, bucket: Dict[str, List[float]], keys: Iterable[Tuple[str, str]]):
+    print(f"\n{title}")
+    print("-" * len(title))
+    for label, key in keys:
+        print(f"{label:<34} {mean(bucket, key):.4f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Diagnose whether the non-key path behaves like prediction reuse."
+    )
+    parser.add_argument("-c", "--config", required=True)
+    parser.add_argument("-w", "--weights", required=True)
+    parser.add_argument("--gap", type=int, default=4, help="Key to non-key frame gap. gap=4 corresponds to skip 3.")
+    parser.add_argument("--frame-stride", type=int, default=8)
+    parser.add_argument("--max-pairs", type=int, default=120)
+    parser.add_argument("--score-thr", type=float, default=0.3)
+    parser.add_argument("--query-topk", type=int, default=100)
+    parser.add_argument("--num-workers", type=int, default=0)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Gap: {args.gap} | frame_stride: {args.frame_stride} | max_pairs: {args.max_pairs}")
+
+    cfg = YAMLConfig(args.config)
+    model = build_model(cfg, args.weights, device)
+    postprocessor = cfg.postprocessor
+    loader = rebuild_loader(
+        cfg,
+        batch_size=1,
+        gap=args.gap,
+        frame_stride=args.frame_stride,
+        num_workers=args.num_workers,
+    )
+
+    stats = defaultdict(list)
+    processed = 0
+
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(val_dataloader)):
-            img_key, target_key, img_non_key, target_non_key = batch
-            
-            # Metadata for sizing and video tracking
-            img_id = int(target_key[0]['image_id'].item())
-            img_info = val_dataloader.dataset.img_id_to_info[img_id]
-            current_video_id = extract_video_id(img_info['file_name'])
-            force_key = (last_video_id is not None and current_video_id != last_video_id)
-            last_video_id = current_video_id
+        for batch in tqdm(loader, desc="diagnosing"):
+            img_key, target_key, img_nk, target_nk = batch
+            img_key = img_key.to(device)
+            img_nk = img_nk.to(device)
+            target_nk_device = [
+                {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()}
+                for t in target_nk
+            ]
+            orig_nk = torch.stack([t["orig_size"] for t in target_nk_device], dim=0).to(device)
 
-            actual_size_key = torch.tensor([[img_key.shape[-1], img_key.shape[-2]]], device=device) # [W, H]
-            actual_size_nk = torch.tensor([[img_non_key.shape[-1], img_non_key.shape[-2]]], device=device) # [W, H]
+            out_key = model.forward_key_frame(img_key, None)
+            key_norm = normalized_key_result(postprocessor, out_key)
+            reuse_abs = reuse_result_to_size(key_norm, target_nk_device[0])
 
-            # Prepare targets for loss (expects normalized cxcywh)
-            tk_loss = prepare_targets_for_loss(target_key, device)
-            tnk_loss = prepare_targets_for_loss(target_non_key, device)
+            out_nk, fused_features = model.forward_non_key_frame(img_nk, None, return_fused=True)
+            nk_abs = postprocessor(out_nk, orig_nk)[0]
 
-            if nk_counter == 0 or force_key:
-                # Refresh Key Path
-                img_key = img_key.to(device)
-                out_key = model.forward_key_frame(img_key, None)
-                
-                # Metrics (IoU/Conf)
-                results_key = postprocessor(out_key, actual_size_key)[0]
-                record_stats(results_key, target_key, key_ious, key_confs, args.score_thr, device, actual_size_key)
-                record_tp_fp_stats(results_key, target_key, key_tp_scores, key_fp_scores, args.score_thr, device, actual_size_key)
-                
-                # Loss Reporting
-                l_dict = criterion(out_key, tk_loss)
-                loss_stats['key']['class'].append(l_dict['loss_vfl'].item())
-                loss_stats['key']['box'].append((l_dict['loss_bbox'] + l_dict['loss_giou']).item())
-                
-                if args.baseline:
-                    norm_size = torch.tensor([[1.0, 1.0]], device=device)
-                    last_key_results_norm = postprocessor(out_key, norm_size)[0]
-                
-                nk_counter = args.nk_per_key
-            else:
-                nk_counter -= 1
+            teacher_backbone = model.backbone(img_nk)
+            c3, c4, c5 = teacher_backbone[-3:]
+            teacher_ccff = model.encoder([c3, c4, c5])
+            out_cur_key = model.decoder(teacher_ccff, targets=None)
+            if isinstance(out_cur_key, tuple):
+                out_cur_key = out_cur_key[0]
+            cur_key_abs = postprocessor(out_cur_key, orig_nk)[0]
 
-            # Process Non-Key Frame
-            if args.baseline:
-                results_nk = {
-                    'boxes': last_key_results_norm['boxes'] * actual_size_nk.repeat(1, 2),
-                    'scores': last_key_results_norm['scores'],
-                    'labels': last_key_results_norm['labels']
-                }
-                # Note: Loss for baseline isn't directly computable via criterion without running model
-            else:
-                img_non_key = img_non_key.to(device)
-                out_nk = model.forward_non_key_frame(img_non_key, None)
-                results_nk = postprocessor(out_nk, actual_size_nk)[0]
-                
-                # Loss Reporting
-                l_dict = criterion(out_nk, tnk_loss)
-                loss_stats['nk']['class'].append(l_dict['loss_vfl'].item())
-                loss_stats['nk']['box'].append((l_dict['loss_bbox'] + l_dict['loss_giou']).item())
-            
-            record_stats(results_nk, target_non_key, nk_ious, nk_confs, args.score_thr, device, actual_size_nk)
-            record_tp_fp_stats(results_nk, target_non_key, nk_tp_scores, nk_fp_scores, args.score_thr, device, actual_size_nk)
+            update_sum(stats, "reuse_to_nk", pred_similarity(reuse_abs, nk_abs, args.score_thr))
+            update_sum(stats, "nk_to_curkey", pred_similarity(nk_abs, cur_key_abs, args.score_thr))
+            update_sum(stats, "reuse_to_curkey", pred_similarity(reuse_abs, cur_key_abs, args.score_thr))
 
-    # 4. Plotting
-    plt.figure(figsize=(14, 6))
-    bins = np.linspace(0, 1, 51)
-    
-    plt.subplot(1, 2, 1)
-    if key_ious:
-        plt.hist(key_ious, bins=bins, alpha=0.5, label=f'Key (Mean: {np.mean(key_ious):.3f})', color='blue', density=True)
-    if nk_ious:
-        plt.hist(nk_ious, bins=bins, alpha=0.5, label=f'Non-Key (Mean: {np.mean(nk_ious):.3f})', color='orange', density=True)
-    plt.title(f'IoU Distribution ({mode_str})')
-    plt.xlabel('IoU')
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+            key_scores = out_key["pred_logits"].sigmoid().amax(dim=-1)
+            update_sum(
+                stats,
+                "query_key_to_nk",
+                cxcywh_deltas(out_key["pred_boxes"], out_nk["pred_boxes"], args.query_topk, key_scores),
+            )
 
-    plt.subplot(1, 2, 2)
-    if key_confs:
-        plt.hist(key_confs, bins=bins, alpha=0.5, label=f'Key (Mean: {np.mean(key_confs):.3f})', color='blue', density=True)
-    if nk_confs:
-        plt.hist(nk_confs, bins=bins, alpha=0.5, label=f'Non-Key (Mean: {np.mean(nk_confs):.3f})', color='orange', density=True)
-    plt.title(f'Confidence Distribution ({mode_str})')
-    plt.xlabel('Score')
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(args.output)
-    
-    print(f"\nSummary ({mode_str}):")
-    print(f"  Key Path:  Avg IoU: {np.mean(key_ious):.4f} | Avg Conf: {np.mean(key_confs):.4f}")
-    print(f"  NK Path:   Avg IoU: {np.mean(nk_ious):.4f} | Avg Conf: {np.mean(nk_confs):.4f}")
-    
-    def get_sep(tp, fp):
-        if not tp or not fp: return 0.0
-        return np.mean(tp) - np.mean(fp)
+            for level, (cached, fused, teacher) in enumerate(zip(model.cached_ccff, fused_features, teacher_ccff)):
+                update_sum(stats, f"feature_l{level}", feature_stats(cached, fused, teacher))
 
-    print(f"\nTP/FP Score Separation (mean_tp - mean_fp):")
-    print(f"  Key Path:  {get_sep(key_tp_scores, key_fp_scores):.4f}")
-    print(f"  NK Path:   {get_sep(nk_tp_scores, nk_fp_scores):.4f}")
-    
-    print(f"\nLoss Analysis (Raw Criterion Values):")
-    if loss_stats['key']['class']:
-        print(f"  Key Loss:  Class: {np.mean(loss_stats['key']['class']):.4f} | Box: {np.mean(loss_stats['key']['box']):.4f}")
-    if loss_stats['nk']['class']:
-        print(f"  NK Loss:   Class: {np.mean(loss_stats['nk']['class']):.4f} | Box: {np.mean(loss_stats['nk']['box']):.4f}")
+            processed += 1
+            if args.max_pairs > 0 and processed >= args.max_pairs:
+                break
 
-if __name__ == '__main__':
+    print(f"\nProcessed pairs: {processed}")
+    print_table(
+        "Prediction Similarity",
+        stats,
+        [
+            ("reuse -> NK mean best IoU", "reuse_to_nk/mean_best_iou"),
+            ("reuse -> NK matched @0.50", "reuse_to_nk/matched_50"),
+            ("reuse -> NK matched @0.75", "reuse_to_nk/matched_75"),
+            ("NK -> current-key mean best IoU", "nk_to_curkey/mean_best_iou"),
+            ("NK -> current-key matched @0.50", "nk_to_curkey/matched_50"),
+            ("reuse -> current-key mean best IoU", "reuse_to_curkey/mean_best_iou"),
+            ("reuse -> current-key matched @0.50", "reuse_to_curkey/matched_50"),
+        ],
+    )
+    print_table(
+        "Same-Query Motion: Key Output -> NK Output",
+        stats,
+        [
+            ("mean center delta", "query_key_to_nk/query_center_delta"),
+            ("p90 center delta", "query_key_to_nk/query_center_delta_p90"),
+            ("queries moved > 0.01 image", "query_key_to_nk/query_moved_gt_001"),
+            ("queries moved > 0.03 image", "query_key_to_nk/query_moved_gt_003"),
+            ("mean abs log area change", "query_key_to_nk/query_abs_log_area"),
+        ],
+    )
+    for level in range(3):
+        print_table(
+            f"Fusion Feature Level {level}",
+            stats,
+            [
+                ("teacher gap: cached key", f"feature_l{level}/teacher_gap_cached"),
+                ("teacher gap: fused NK", f"feature_l{level}/teacher_gap_fused"),
+                ("fused move from cached", f"feature_l{level}/fused_move_from_cached"),
+                ("gap reduction", f"feature_l{level}/gap_reduction"),
+                ("cos cached vs teacher", f"feature_l{level}/cos_cached_teacher"),
+                ("cos fused vs teacher", f"feature_l{level}/cos_fused_teacher"),
+            ],
+        )
+
+
+if __name__ == "__main__":
     main()

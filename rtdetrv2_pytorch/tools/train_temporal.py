@@ -1,7 +1,6 @@
 """
-Phase 1 Training Script for Temporal RT-DETR
-Run with: python rtdetrv2_pytorch/tools/phase1_training_v2.py -c rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml --pretrained best_virat.pth --training_strategy freeze_key
-KD only run with: python rtdetrv2_pytorch/tools/phase1_training_v2.py -c rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml --pretrained <model_path> --training_strategy freeze_key --kd_only
+Temporal RT-DETR training script.
+Run with: python rtdetrv2_pytorch/tools/train_temporal.py -c rtdetrv2_pytorch/configs/kndrtr/temporal_kndetr_mot17.yml -s freeze_key -t <model_path>
 """
 
 import os 
@@ -16,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import argparse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 
 from src.core._config import BaseConfig
 
@@ -89,17 +88,12 @@ def _compare_prefixed_state_dicts(
         'max_abs_diff': max_abs_diff,
     }
 
-class Phase1Trainer:
+class Trainer:
     """
     Training Strategies:
-    --- The Two-Stage Curriculum ---
-    - 'kd_only': Stage 1 - Train fusion blocks via Feature MSE. (same_frame disabled)
-    - 'decoder_only': Stage 2 - Train light decoder via Hungarian. (same_frame disabled)
-    
-    --- Joint & Fine-tuning Modes ---
-    - 'kd': Joint Tuning - Train fusion + light decoder via Hungarian + Feature MSE.
-    - 'freeze_key': Train fusion + light decoder via Hungarian. (same_frame supported)
-    - 'joint': Train fusion + light decoder + key decoder via Hungarian. (same_frame supported)
+    - 'kd': Train fusion + light decoder via Hungarian + feature/score KD. (not supported with same_frame)
+    - 'freeze_key': Train fusion + light decoder via Hungarian. (no KD)
+    - 'joint': Train fusion + light decoder + key decoder via Hungarian. (no KD)
     """
     def __init__(
         self,
@@ -116,8 +110,6 @@ class Phase1Trainer:
         clip_max_norm: float = 0.1,
         training_strategy: str = 'joint',
         same_frame: bool = False,
-        reuse_match_indices: bool = False,
-        freeze_fusion: bool = False,
         provenance: Optional[Dict[str, object]] = None,
     ):
         self.model = model
@@ -134,45 +126,21 @@ class Phase1Trainer:
         self.clip_max_norm = clip_max_norm
         self.training_strategy = training_strategy
         self.same_frame = same_frame
-        self.reuse_match_indices = reuse_match_indices
-        self.freeze_fusion = freeze_fusion
         self.provenance = provenance or {}
         self.lambda_score = getattr(self.cfg, 'lambda_score', 15.0)
         
-        valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
+        valid_strategies = ['kd', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
             raise ValueError(f"Unknown training strategy: {self.training_strategy}. Must be one of {valid_strategies}")
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.training_strategy in ['kd', 'joint']:
-               self.lambda_kd = getattr(self.cfg, 'lambda_kd', 150.0)
-               if self.training_strategy == 'kd' or self.lambda_kd > 0 or self.lambda_score > 0:
-                   print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
-                   print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
+            self.lambda_kd = getattr(self.cfg, 'lambda_kd', 150.0)
+            if self.training_strategy == 'kd' or self.lambda_kd > 0 or self.lambda_score > 0:
+                print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
+                print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
 
         if self.same_frame:
             print("--same_frame is active.")
-        if self.freeze_fusion:
-            print("--freeze_fusion is active: fusion blocks stay identity/frozen during training.")
-
-    def _sanitize_cached_indices(
-        self,
-        cached_indices: List[Tuple[torch.Tensor, torch.Tensor]],
-        targets: List[Dict],
-        num_queries: int,
-    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        sanitized = []
-        for (src_idx, tgt_idx), target in zip(cached_indices, targets):
-            src_idx = src_idx.to(self.device, dtype=torch.int64)
-            tgt_idx = tgt_idx.to(self.device, dtype=torch.int64)
-            max_tgt = target['labels'].shape[0]
-            valid = (
-                (src_idx >= 0)
-                & (src_idx < num_queries)
-                & (tgt_idx >= 0)
-                & (tgt_idx < max_tgt)
-            )
-            sanitized.append((src_idx[valid], tgt_idx[valid]))
-        return sanitized
 
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -180,17 +148,12 @@ class Phase1Trainer:
         """
         self.model.train()
 
-        if self.freeze_fusion and hasattr(self.model, 'fusion_blocks'):
-            self.model.fusion_blocks.eval()
-
-        if self.training_strategy in ['kd', 'kd_only', 'decoder_only', 'freeze_key']:
+        if self.training_strategy in ['kd', 'freeze_key']:
             for name, module in self.model.named_modules():
                 # Force backbone and encoder normalizations to stay frozen
                 if 'backbone' in name or 'encoder' in name:
                     module.eval()
                 if 'decoder' in name and 'lightweight_decoder' not in name:
-                    module.eval()
-                if self.freeze_fusion and 'fusion_blocks' in name:
                     module.eval()
         total_loss = 0.0
         total_loss_key = 0.0
@@ -228,7 +191,7 @@ class Phase1Trainer:
             # 1. KEY FRAME PATH (The Teacher)
             if self.training_strategy == 'joint':
                 outputs_key = self.model.forward_key_frame(img_key, target_key)
-                if self.reuse_match_indices or self.lambda_score > 0:
+                if self.lambda_score > 0:
                     loss_dict_key, key_indices = self.criterion(
                         outputs_key, target_key, return_indices=True
                     )
@@ -243,23 +206,25 @@ class Phase1Trainer:
                 loss = loss_key
                 loss_key_value = loss_key.item()
             else:
-                # For kd, kd_only, decoder_only, and freeze_key
+                # For kd and freeze_key, use the key path as a frozen teacher/cache source.
                 self.model.backbone.eval()
                 if hasattr(self.model, 'encoder'):
                     self.model.encoder.eval()
-                if self.training_strategy in ['kd', 'kd_only', 'decoder_only', 'freeze_key'] and hasattr(self.model, 'decoder'):
+                if hasattr(self.model, 'decoder'):
                     if hasattr(self.model, 'decoder'):
                         self.model.decoder.eval()
                     with torch.no_grad():
                         outputs_key = self.model.forward_key_frame(img_key, target_key)
                         # Always get key indices for 'kd' strategy to enable Score Distillation
-                        if self.reuse_match_indices or self.training_strategy in ['kd', 'kd_only']:
+                        if self.training_strategy == 'kd':
                             _, key_indices = self.criterion(
                                 outputs_key, target_key, return_indices=True
                             )
 
             # 2. NON-KEY FRAME PATH (The Student)
-            use_kd = self.training_strategy in ['kd', 'kd_only'] or (self.training_strategy == 'joint' and (self.lambda_kd > 0 or self.lambda_score > 0))
+            use_kd = self.training_strategy == 'kd' or (
+                self.training_strategy == 'joint' and (self.lambda_kd > 0 or self.lambda_score > 0)
+            )
             if use_kd:
 
                 with torch.no_grad():
@@ -276,18 +241,8 @@ class Phase1Trainer:
                     for s_feat, t_feat in zip(student_fused, teacher_ccff):
                         loss_kd_feat += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
 
-                # --- Score KD Logic ---
-                criterion_kwargs = {}
-                if self.reuse_match_indices:
-                    if key_indices is None:
-                        raise RuntimeError("Expected key matcher indices, but got None with --reuse_match_indices")
-                    num_queries = outputs_non_key['pred_boxes'].shape[1]
-                    criterion_kwargs['cached_indices'] = self._sanitize_cached_indices(
-                        key_indices, target_non_key, num_queries
-                    )
-
                 loss_dict_non_key, non_key_indices = self.criterion(
-                    outputs_non_key, target_non_key, **criterion_kwargs, return_indices=True
+                    outputs_non_key, target_non_key, return_indices=True
                 )
                 loss_hungarian = sum(loss_dict_non_key.values())
 
@@ -311,33 +266,19 @@ class Phase1Trainer:
                     if num_matched_common > 0:
                         loss_kd_score /= num_matched_common
 
-                # Assign to non-key loss
-                if self.training_strategy == 'kd_only':
-                    loss_non_key = self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
-                else:
-                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
+                loss_non_key = loss_hungarian + self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
 
                 total_feat_mse += loss_kd_feat.item() if isinstance(loss_kd_feat, torch.Tensor) else loss_kd_feat
                 total_score_mse += loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
 
             else:
-                # Standard Hungarian loss (decoder_only, freeze_key, and joint)
+                # Standard Hungarian loss (freeze_key, and joint)
                 # Note: 'joint' hits this only if lambda_kd=0 and lambda_score=0
                 outputs_non_key = self.model.forward_non_key_frame(
                     img_non_key, target_non_key
                 )
-                criterion_kwargs = {}
-                if self.reuse_match_indices:
-                    if key_indices is None:
-                        raise RuntimeError("Expected key matcher indices, but got None with --reuse_match_indices")
-                    num_queries = outputs_non_key['pred_boxes'].shape[1]
-                    criterion_kwargs['cached_indices'] = self._sanitize_cached_indices(
-                        key_indices,
-                        target_non_key,
-                        num_queries,
-                    )
                 loss_dict_non_key = self.criterion(
-                    outputs_non_key, target_non_key, **criterion_kwargs
+                    outputs_non_key, target_non_key
                 )
                 # RTDETRCriterionv2 already applies weight_dict internally.
                 loss_non_key = sum(loss_dict_non_key.values())
@@ -367,10 +308,7 @@ class Phase1Trainer:
                 f_mse = loss_kd_feat.item() if isinstance(loss_kd_feat, torch.Tensor) else loss_kd_feat
                 s_mse = loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
                 
-                if self.training_strategy == 'kd_only':
-                    print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})")
-                elif self.training_strategy == 'kd':
+                if self.training_strategy == 'kd':
                     print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
                           f"Loss: {loss.item():.4f} (Hungarian: {loss_hungarian.item():.4f}, Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})")
                 elif self.training_strategy == 'joint':
@@ -586,7 +524,7 @@ def build_model_from_config(config_path: str, device: torch.device):
         hidden_dim = decoder_cfg.get('hidden_dim', 256)
         num_queries = decoder_cfg.get('num_queries', 300)
     
-    # Get Phase 1 specific parameters
+    # Get temporal training parameters
     use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
     reuse_position = cfg.yaml_cfg.get('reuse_position', 0)
     
@@ -600,59 +538,30 @@ def build_model_from_config(config_path: str, device: torch.device):
         num_queries=num_queries,
         use_lightweight_decoder=use_lightweight_decoder,
         reuse_position=reuse_position,
-        enable_apg=cfg.yaml_cfg.get('enable_apg', False),
-        apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
-        apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
-        apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
     )
     
     return temporal_model, cfg
 
-
-def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, device: torch.device):
-    """
-    Load pretrained weights for key frame path
-    """
-    print(f"\nLoading pretrained key frame path from: {pretrained_path}")
-    
-    checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
-    state_dict = checkpoint['model']
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    
-    if missing_keys:
-        print(f"  Missing keys (new components): {len(missing_keys)}")
-    if unexpected_keys:
-        print(f"  Unexpected keys: {len(unexpected_keys)}")
-    
-    print(f"  Success!")
 
 def main():
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--config', '-c', type=str, required=True)
     parser.add_argument('--training_strategy', '-s', type=str, default='freeze_key',
-                        choices=['freeze_key', 'joint', 'kd', 'kd_only', 'decoder_only'],
-                        help='freeze_key, joint, kd, kd_only, or decoder_only')
+                        choices=['freeze_key', 'joint', 'kd'],
+                        help='freeze_key, joint, or kd')
     parser.add_argument('--tuning', '-t', type=str, default=None,
                        help='Tuning from checkpoint (auto-detects key-only vs full temporal)')
     parser.add_argument('--eval_only', action='store_true',
                        help='Skip training and only run evaluation on the provided weights')
     parser.add_argument('--eval_before_train', action='store_true',
                        help='Run one validation pass before the first training epoch')
-    parser.add_argument('--verify_pretrained_only', action='store_true',
-                       help='Verify pretrained load integrity, run one evaluation pass, then exit')
     parser.add_argument('--same_frame', action='store_true',
                        help='Diagnostic: Force non-key frame to be identical to key frame')
-    parser.add_argument('--init_weights', action='store_true', 
-                       help='Warm start: Copy pretrained key decoder weights to non-key decoder')
-    parser.add_argument('--reuse_match_indices', action='store_true',
-                       help='Reuse key-frame matcher indices for non-key loss (default: disabled)')
-    parser.add_argument('--freeze_fusion', action='store_true',
-                       help='Freeze fusion blocks as identity. Useful for same-frame level0 decoder/head warmup.')
     parser.add_argument('--lambda_kd', type=float, default=None,
-                       help='Weighted scale for KD loss (only used in kd strategy)')
+                       help='Weighted scale for feature KD loss in kd/joint strategies')
     parser.add_argument('--lambda_score', type=float, default=None,
-                       help='Weighted scale for Score KD loss (only used in kd strategy)')
+                       help='Weighted scale for score KD loss in kd/joint strategies')
 
     # Optional
     parser.add_argument('--resume', '-r', type=str, default=None, 
@@ -741,27 +650,9 @@ def main():
             }
             print("   Success!")
 
-        if args.init_weights:
-            if is_temporal:
-                print("\n=> [Skipping init_weights] Full temporal model detected. Preserving trained lightweight decoder weights.")
-            else:
-                print("\n=> Initializing Lightweight Decoder from Heavy Decoder...")
-                if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
-                    heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
-                    model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
-                    print("   ✅ Successfully copied perfectly trained heavy transformer layer!")
-
-        if hasattr(model, 'repair_dead_fusion_gates'):
-            repaired_blocks = model.repair_dead_fusion_gates()
-            if repaired_blocks:
-                print(
-                    "\n=> Repaired dead fusion residual gates in blocks "
-                    f"{repaired_blocks}: final BN scale was zero while final conv was zero."
-                )
-        
         # Get config values (with overrides)
         epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
-        output_dir = args.output_dir if args.output_dir is not None else getattr(cfg, 'output_dir', 'output/phase1_virat')
+        output_dir = args.output_dir if args.output_dir is not None else getattr(cfg, 'output_dir', 'output/temporal_virat')
         seed = args.seed if args.seed is not None else getattr(cfg, 'seed', 42)
         lambda_non_key = getattr(cfg, 'lambda_non_key', 0.5)
         print_freq = getattr(cfg, 'print_freq', 50)
@@ -781,8 +672,6 @@ def main():
         print(f"\nConfiguration:")
         print(f"  Epochs:           {epochs}")
         print(f"  Training strategy: {args.training_strategy}")
-        print(f"  Reuse match idx:  {args.reuse_match_indices}")
-        print(f"  Freeze fusion:    {args.freeze_fusion}")
         print(f"  Lambda (non-key): {lambda_non_key}")
         print(f"  Output dir:       {output_dir}")
         print(f"  Seed:             {seed}")
@@ -815,44 +704,22 @@ def main():
     criterion = cfg.criterion
     print("\n=> Preparing Temporal Model for Optimizer Registration...")
 
-    if args.training_strategy in ['freeze_key', 'kd'] and not args.reuse_match_indices:
+    if args.training_strategy in ['freeze_key', 'kd']:
         model.decouple_non_key_prediction_heads()
         print("   Enabled decoupled non-key heads/query_pos for fresh-matcher training.")
 
-    if args.freeze_fusion and args.training_strategy == 'kd_only':
-        print("❌ Error: --freeze_fusion with -s kd_only leaves no trainable fusion parameters.")
-        sys.exit(1)
-    
     trainable_params = []
     
     for name, param in model.named_parameters():
-        if args.training_strategy == 'kd_only':
-            # Train fusion blocks ONLY. 
-            if 'fusion_blocks' in name and not args.freeze_fusion:
-                param.requires_grad = True
-                trainable_params.append(param)
-            else:
-                param.requires_grad = False
-                
-        elif args.training_strategy == 'decoder_only':
-            # Train lightweight transformer layers ONLY.
-            if 'lightweight_decoder.decoder' in name:
-                param.requires_grad = True
-                trainable_params.append(param)
-            else:
-                param.requires_grad = False
-                
-        elif args.training_strategy in ['freeze_key', 'kd']:
+        if args.training_strategy in ['freeze_key', 'kd']:
             # Train fusion blocks and lightweight decoder. Freeze heavy model.
             train_prediction_modules = (
-                not args.reuse_match_indices and (
-                    'lightweight_decoder.dec_score_head' in name
-                    or 'lightweight_decoder.dec_bbox_head' in name
-                    or 'lightweight_decoder.query_pos_head' in name
-                )
+                'lightweight_decoder.dec_score_head' in name
+                or 'lightweight_decoder.dec_bbox_head' in name
+                or 'lightweight_decoder.query_pos_head' in name
             )
             if (
-                ('fusion_blocks' in name and not args.freeze_fusion)
+                'fusion_blocks' in name
                 or 'lightweight_decoder.decoder' in name
                 or train_prediction_modules
             ):
@@ -865,7 +732,7 @@ def main():
             # Train heavy decoder, fusion blocks, and light decoder.
             if (
                 'decoder.' in name
-                or ('fusion_blocks' in name and not args.freeze_fusion)
+                or 'fusion_blocks' in name
                 or 'lightweight_decoder.decoder' in name
             ):
                 param.requires_grad = True
@@ -898,7 +765,7 @@ def main():
     postprocessor = cfg.postprocessor
 
     # Trainer
-    trainer = Phase1Trainer(
+    trainer = Trainer(
         model=model,
         criterion=criterion,
         optimizer=optimizer,
@@ -912,27 +779,9 @@ def main():
         clip_max_norm=clip_max_norm,
         training_strategy=args.training_strategy,
         same_frame=args.same_frame,
-        reuse_match_indices=args.reuse_match_indices,
-        freeze_fusion=args.freeze_fusion,
         provenance=pretrained_metadata,
     )
 
-    if args.verify_pretrained_only:
-        print("\n" + "="*80)
-        print("Executing PRETRAINED VERIFICATION ONLY Mode...")
-        print("="*80)
-        if not args.tuning:
-            print("❌ Error: --verify_pretrained_only requires --tuning.")
-            sys.exit(1)
-        if val_dataloader is None:
-            print("⚠️ Warning: No validation dataloader found. Load integrity check already completed.")
-            return
-        verify_stats = trainer.evaluate(val_dataloader, epoch=0)
-        print("\nVerification Evaluation Stats:")
-        for k, v in verify_stats.items():
-            print(f"  {k}: {v:.4f}")
-        return
-    
     if args.eval_only:
         print("\n" + "="*80)
         print("Executing EVALUATION ONLY Mode...")

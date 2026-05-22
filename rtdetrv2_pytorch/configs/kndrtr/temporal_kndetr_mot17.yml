@@ -1,4 +1,4 @@
-# Phase 1 Temporal RT-DETR Training Configuration for MOT17 Dataset
+# Temporal RT-DETR Training Configuration for MOT17 Dataset
 
 __include__: [
   '../dataset/mot17_temporal_detection.yml',
@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_mot17_skip5_v3'
-summary_dir: './output/phase1_mot17_skip5_v3/summary'
+output_dir: './output/phase1_mot17_skip5_v4'
+summary_dir: './output/phase1_mot17_skip5_v4/summary'
 
 # Override to ResNet18
 PResNet:
@@ -31,13 +31,12 @@ RTDETRTransformerv2:
 RTDETRTransformer:
   num_classes: ${num_classes}
 
-# Phase 1 Temporal Training Specific Parameters
+# Temporal Training Specific Parameters
 lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
 
 # Non-key frame decoder configuration
-use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)
+use_lightweight_decoder: True  # True: use the fixed 1-layer non-key decoder
 reuse_position: 3             # Reuse query state from key decoder position (0=before decoder, 1..L=after layer)
-non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
 epoches: 10

@@ -10,7 +10,7 @@ remap_mscoco_category: False
 train_dataloader: 
   type: DataLoader
   dataset: 
-    type: ViratTemporalDataset
+    type: TemporalVideoDataset
     root_dir: ../dataset/VIRAT/train_30/
     ann_file: ../dataset/VIRAT/train_30.json
     max_frame_gap: 5
@@ -45,7 +45,7 @@ train_dataloader:
 val_dataloader:
   type: DataLoader
   dataset: 
-    type: ViratTemporalDataset
+    type: TemporalVideoDataset
     root_dir: ../dataset/VIRAT/val_30/
     ann_file: ../dataset/VIRAT/val_30.json
     max_frame_gap: 5

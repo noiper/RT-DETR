@@ -136,7 +136,7 @@ class RTDETRCriterionv2(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def forward(self, outputs, targets, cached_indices=None, return_indices=False, **kwargs):
+    def forward(self, outputs, targets, return_indices=False, **kwargs):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -144,14 +144,8 @@ class RTDETRCriterionv2(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
-
-        if cached_indices is None:
-            # Standard DETR: Run the matcher to find the best assignment.
-            matched = self.matcher(outputs_without_aux, targets)
-            indices = matched['indices']
-        else:
-            # Temporal DETR: Force the model to use the key frame's assignment.
-            indices = cached_indices
+        matched = self.matcher(outputs_without_aux, targets)
+        indices = matched['indices']
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
