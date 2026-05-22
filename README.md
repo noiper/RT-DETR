@@ -1,4 +1,4 @@
-# KNDETR Notes
+# KNDETR
 
 KNDETR is a temporal RT-DETR variant for video detection. Key frames run the full RT-DETR path and cache encoder/query features. Non-Key frames reuse the cache, fuse it with the current backbone feature, and run a lightweight decoder.
 
