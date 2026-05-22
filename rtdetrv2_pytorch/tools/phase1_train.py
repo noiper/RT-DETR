@@ -117,6 +117,7 @@ class Phase1Trainer:
         training_strategy: str = 'joint',
         same_frame: bool = False,
         reuse_match_indices: bool = False,
+        freeze_fusion: bool = False,
         provenance: Optional[Dict[str, object]] = None,
     ):
         self.model = model
@@ -134,16 +135,13 @@ class Phase1Trainer:
         self.training_strategy = training_strategy
         self.same_frame = same_frame
         self.reuse_match_indices = reuse_match_indices
+        self.freeze_fusion = freeze_fusion
         self.provenance = provenance or {}
         self.lambda_score = getattr(self.cfg, 'lambda_score', 15.0)
         
         valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
             raise ValueError(f"Unknown training strategy: {self.training_strategy}. Must be one of {valid_strategies}")
-        if self.same_frame and self.training_strategy in ['kd', 'kd_only', 'decoder_only']:
-            print(f"  [Warning] --same_frame is not supported for '{self.training_strategy}'. Disabling it.")
-            self.same_frame = False
-
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.training_strategy in ['kd', 'joint']:
                self.lambda_kd = getattr(self.cfg, 'lambda_kd', 150.0)
@@ -153,6 +151,8 @@ class Phase1Trainer:
 
         if self.same_frame:
             print("--same_frame is active.")
+        if self.freeze_fusion:
+            print("--freeze_fusion is active: fusion blocks stay identity/frozen during training.")
 
     def _sanitize_cached_indices(
         self,
@@ -180,12 +180,17 @@ class Phase1Trainer:
         """
         self.model.train()
 
+        if self.freeze_fusion and hasattr(self.model, 'fusion_blocks'):
+            self.model.fusion_blocks.eval()
+
         if self.training_strategy in ['kd', 'kd_only', 'decoder_only', 'freeze_key']:
             for name, module in self.model.named_modules():
                 # Force backbone and encoder normalizations to stay frozen
                 if 'backbone' in name or 'encoder' in name:
                     module.eval()
                 if 'decoder' in name and 'lightweight_decoder' not in name:
+                    module.eval()
+                if self.freeze_fusion and 'fusion_blocks' in name:
                     module.eval()
         total_loss = 0.0
         total_loss_key = 0.0
@@ -242,7 +247,7 @@ class Phase1Trainer:
                 self.model.backbone.eval()
                 if hasattr(self.model, 'encoder'):
                     self.model.encoder.eval()
-                if self.training_strategy in ['kd', 'kd_only', 'decoder_only'] and hasattr(self.model, 'decoder'):
+                if self.training_strategy in ['kd', 'kd_only', 'decoder_only', 'freeze_key'] and hasattr(self.model, 'decoder'):
                     if hasattr(self.model, 'decoder'):
                         self.model.decoder.eval()
                     with torch.no_grad():
@@ -642,6 +647,8 @@ def main():
                        help='Warm start: Copy pretrained key decoder weights to non-key decoder')
     parser.add_argument('--reuse_match_indices', action='store_true',
                        help='Reuse key-frame matcher indices for non-key loss (default: disabled)')
+    parser.add_argument('--freeze_fusion', action='store_true',
+                       help='Freeze fusion blocks as identity. Useful for same-frame level0 decoder/head warmup.')
     parser.add_argument('--lambda_kd', type=float, default=None,
                        help='Weighted scale for KD loss (only used in kd strategy)')
     parser.add_argument('--lambda_score', type=float, default=None,
@@ -775,6 +782,7 @@ def main():
         print(f"  Epochs:           {epochs}")
         print(f"  Training strategy: {args.training_strategy}")
         print(f"  Reuse match idx:  {args.reuse_match_indices}")
+        print(f"  Freeze fusion:    {args.freeze_fusion}")
         print(f"  Lambda (non-key): {lambda_non_key}")
         print(f"  Output dir:       {output_dir}")
         print(f"  Seed:             {seed}")
@@ -810,13 +818,17 @@ def main():
     if args.training_strategy in ['freeze_key', 'kd'] and not args.reuse_match_indices:
         model.decouple_non_key_prediction_heads()
         print("   Enabled decoupled non-key heads/query_pos for fresh-matcher training.")
+
+    if args.freeze_fusion and args.training_strategy == 'kd_only':
+        print("❌ Error: --freeze_fusion with -s kd_only leaves no trainable fusion parameters.")
+        sys.exit(1)
     
     trainable_params = []
     
     for name, param in model.named_parameters():
         if args.training_strategy == 'kd_only':
             # Train fusion blocks ONLY. 
-            if 'fusion_blocks' in name:
+            if 'fusion_blocks' in name and not args.freeze_fusion:
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -839,7 +851,11 @@ def main():
                     or 'lightweight_decoder.query_pos_head' in name
                 )
             )
-            if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name or train_prediction_modules:
+            if (
+                ('fusion_blocks' in name and not args.freeze_fusion)
+                or 'lightweight_decoder.decoder' in name
+                or train_prediction_modules
+            ):
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -847,7 +863,11 @@ def main():
                 
         elif args.training_strategy == 'joint':
             # Train heavy decoder, fusion blocks, and light decoder.
-            if 'decoder.' in name or 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
+            if (
+                'decoder.' in name
+                or ('fusion_blocks' in name and not args.freeze_fusion)
+                or 'lightweight_decoder.decoder' in name
+            ):
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -893,6 +913,7 @@ def main():
         training_strategy=args.training_strategy,
         same_frame=args.same_frame,
         reuse_match_indices=args.reuse_match_indices,
+        freeze_fusion=args.freeze_fusion,
         provenance=pretrained_metadata,
     )
 

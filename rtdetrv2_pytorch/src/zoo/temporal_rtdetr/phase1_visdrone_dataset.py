@@ -5,9 +5,9 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torchvision.datasets import CocoDetection
-from torchvision import datapoints
 
 from src.core import register
+from src.data._misc import convert_to_tv_tensor
 from src.data.transforms import Compose
 
 @register()
@@ -117,10 +117,11 @@ class VisDroneTemporalDataset(CocoDetection):
             iscrowd = torch.tensor([obj.get('iscrowd', 0) for obj in target], dtype=torch.int64)
             
         # Manually wrap boxes to satisfy strict V2 Transforms
-        res_target['boxes'] = datapoints.BoundingBox(
-            boxes, 
-            format="XYWH", 
-            spatial_size=(h, w)
+        res_target['boxes'] = convert_to_tv_tensor(
+            boxes,
+            key='boxes',
+            box_format='xywh',
+            spatial_size=(h, w),
         )
         res_target['labels'] = labels
         res_target['area'] = area
