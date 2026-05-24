@@ -358,7 +358,8 @@ class Trainer:
         print(f"\n{'='*80}")
         print(f"Evaluating Epoch {epoch}...")
 
-        results_key = []
+        eval_key_path = self.training_strategy == 'joint'
+        results_key = [] if eval_key_path else None
         results_non_key = []
         eval_img_ids_key = set()
         eval_img_ids_non_key = set()
@@ -371,9 +372,10 @@ class Trainer:
             img_key = img_key.to(self.device)
             # --- KEY FRAME ---
             outputs_key = self.model.forward_key_frame(img_key, None)
-            orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(self.device)
-            res_key = self.postprocessor(outputs_key, orig_sizes_k)
-            self._accumulate(results_key, target_key, res_key, eval_img_ids_key)
+            if eval_key_path:
+                orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(self.device)
+                res_key = self.postprocessor(outputs_key, orig_sizes_k)
+                self._accumulate(results_key, target_key, res_key, eval_img_ids_key)
             # --- NON-KEY FRAME ---
             if isinstance(img_non_key, torch.Tensor):
                 img_non_key = img_non_key.to(self.device)
@@ -387,16 +389,20 @@ class Trainer:
                 print(f"  Processed {batch_idx}/{len(val_dataloader)} batches")
 
         stats = {}
-        print("\n>>> KEY FRAME RESULTS:")
-        k_stats = self._run_coco_eval(coco_gt, results_key, eval_img_ids_key)
-        stats.update({f'key_{k}': v for k, v in k_stats.items()})
+        k_stats = None
+        if eval_key_path:
+            print("\n>>> KEY FRAME RESULTS:")
+            k_stats = self._run_coco_eval(coco_gt, results_key, eval_img_ids_key)
+            stats.update({f'key_{k}': v for k, v in k_stats.items()})
         
         print("\n>>> NON-KEY FRAME RESULTS:")
         nk_stats = self._run_coco_eval(coco_gt, results_non_key, eval_img_ids_non_key)
         stats.update({f'non_key_{k}': v for k, v in nk_stats.items()})
-        print(f"Gap (Key - NonKey) mAP: {k_stats['mAP'] - nk_stats['mAP']:.4f}")
+        if k_stats is not None:
+            print(f"Gap (Key - NonKey) mAP: {k_stats['mAP'] - nk_stats['mAP']:.4f}")
 
-        del results_key
+        if results_key is not None:
+            del results_key
         del results_non_key
         gc.collect()
 
@@ -665,7 +671,7 @@ def main():
         if args.lambda_score is not None:
             cfg.lambda_score = args.lambda_score
 
-        summary_dir = getattr(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
+        summary_dir = os.path.join(output_dir, 'summary')
         writer = SummaryWriter(log_dir=summary_dir)
         print(f"  Summary dir:      {summary_dir}")
         

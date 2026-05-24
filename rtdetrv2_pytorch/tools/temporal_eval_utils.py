@@ -9,6 +9,10 @@ import torch
 from pycocotools.cocoeval import COCOeval
 
 
+DEFAULT_NONKEY_SCORE_GRID = [round(1.0 + 0.01 * i, 2) for i in range(21)]
+NONKEY_SCORE_TUNE_PATIENCE = 3
+
+
 def scale_results(results, score_scale):
     if score_scale == 1.0:
         return results
@@ -19,40 +23,27 @@ def scale_results(results, score_scale):
         scaled.append(out)
     return scaled
 
-
-def parse_scale_grid(grid_text):
-    values = []
-    for token in grid_text.split(','):
-        token = token.strip()
-        if not token:
-            continue
-        values.append(float(token))
-    if not values:
-        raise ValueError("score scale grid cannot be empty")
-    return values
-
-
 def evaluate_map(coco_gt, results, img_ids: Optional[Set[int]] = None):
     """Runs pycocotools evaluation and returns all 12 COCO stats."""
     if not results and not img_ids:
         return np.zeros(12)
 
-    if not results:
-        coco_dt = coco_gt.loadRes([])
-    else:
-        coco_dt = coco_gt.loadRes(results)
-
-    evaluator = COCOeval(coco_gt, coco_dt, 'bbox')
-
-    # Limit evaluation to predicted/selected stream images instead of the full val set.
-    if img_ids is not None:
-        evaluator.params.imgIds = sorted(list(img_ids))
-    else:
-        evaluator.params.imgIds = sorted(list({res['image_id'] for res in results}))
-
-    evaluator.evaluate()
-    evaluator.accumulate()
     with contextlib.redirect_stdout(io.StringIO()):
+        if not results:
+            coco_dt = coco_gt.loadRes([])
+        else:
+            coco_dt = coco_gt.loadRes(results)
+
+        evaluator = COCOeval(coco_gt, coco_dt, 'bbox')
+
+        # Limit evaluation to predicted/selected stream images instead of the full val set.
+        if img_ids is not None:
+            evaluator.params.imgIds = sorted(list(img_ids))
+        else:
+            evaluator.params.imgIds = sorted(list({res['image_id'] for res in results}))
+
+        evaluator.evaluate()
+        evaluator.accumulate()
         evaluator.summarize()
 
     if len(evaluator.stats) < 12:
