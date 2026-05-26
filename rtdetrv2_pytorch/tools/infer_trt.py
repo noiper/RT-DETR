@@ -75,7 +75,7 @@ class TensorRTInference:
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
         ]
 
-        self._signature: Optional[Tuple[Tuple[str, Tuple[int, ...], torch.dtype], ...]] = None
+        self._signature: Optional[Tuple[Tuple[str, Tuple[int, ...], torch.dtype, bool], ...]] = None
         self._buffers: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._binding_addrs: OrderedDict[str, int] = OrderedDict()
 
@@ -96,12 +96,13 @@ class TensorRTInference:
                 f"Found inputs={self.input_names}, outputs={self.output_names}"
             )
 
-    def _ensure_buffers(self, blob: Dict[str, torch.Tensor]):
+    def _ensure_buffers(self, blob: Dict[str, torch.Tensor], zero_copy_inputs: Optional[set] = None):
+        zero_copy_inputs = zero_copy_inputs or set()
         missing = [name for name in self.input_names if name not in blob]
         if missing:
             raise RuntimeError(f"Missing input tensors for inference: {missing}")
 
-        signature: List[Tuple[str, Tuple[int, ...], torch.dtype]] = []
+        signature: List[Tuple[str, Tuple[int, ...], torch.dtype, bool]] = []
         for name in self.input_names:
             tensor = blob[name]
             if not isinstance(tensor, torch.Tensor):
@@ -111,7 +112,7 @@ class TensorRTInference:
                     f"Input '{name}' is on {tensor.device}, expected {self.device}. "
                     "Move all tensors to the inference device before calling infer()."
                 )
-            signature.append((name, tuple(tensor.shape), tensor.dtype))
+            signature.append((name, tuple(tensor.shape), tensor.dtype, name in zero_copy_inputs))
 
         sig_tuple = tuple(signature)
         if sig_tuple == self._signature:
@@ -123,8 +124,11 @@ class TensorRTInference:
         for name in self.input_names:
             tensor = blob[name]
             self.context.set_input_shape(name, tuple(tensor.shape))
-            self._buffers[name] = torch.empty_like(tensor, device=self.device)
-            self._binding_addrs[name] = self._buffers[name].data_ptr()
+            if name in zero_copy_inputs:
+                self._binding_addrs[name] = tensor.data_ptr()
+            else:
+                self._buffers[name] = torch.empty_like(tensor, device=self.device)
+                self._binding_addrs[name] = self._buffers[name].data_ptr()
 
         for name in self.output_names:
             shape = tuple(self.context.get_tensor_shape(name))
@@ -140,10 +144,17 @@ class TensorRTInference:
 
         self._signature = sig_tuple
 
-    def infer(self, blob: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        self._ensure_buffers(blob)
+    def infer(self, blob: Dict[str, torch.Tensor], zero_copy_inputs: Optional[set] = None) -> Dict[str, torch.Tensor]:
+        zero_copy_inputs = zero_copy_inputs or set()
+        self._ensure_buffers(blob, zero_copy_inputs)
+
+        for name in zero_copy_inputs:
+            if name in self.input_names:
+                self._binding_addrs[name] = blob[name].data_ptr()
 
         for name in self.input_names:
+            if name in zero_copy_inputs:
+                continue
             self._buffers[name].copy_(blob[name])
 
         bindings = [int(self._binding_addrs[name]) for name in self.tensor_names]
@@ -430,10 +441,14 @@ def _evaluate_coco_map(coco_gt, results: List[Dict], img_ids: set) -> List[float
     return [float(v) for v in evaluator.stats]
 
 
-def _timed_infer(engine: TensorRTInference, blob: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, torch.Tensor]]:
+def _timed_infer(
+    engine: TensorRTInference,
+    blob: Dict[str, torch.Tensor],
+    zero_copy_inputs: Optional[set] = None,
+) -> Tuple[float, Dict[str, torch.Tensor]]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    outputs = engine.infer(blob)
+    outputs = engine.infer(blob, zero_copy_inputs=zero_copy_inputs)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     return (t1 - t0) * 1000.0, outputs
@@ -620,7 +635,7 @@ def main():
                     "orig_target_sizes": orig_target_sizes,
                 }
                 infer_ms, key_out = _timed_infer(key_engine, key_blob)
-                latest_cache = {name: key_out[name].clone() for name in KEY_CACHE_NAMES}
+                latest_cache = {name: key_out[name] for name in KEY_CACHE_NAMES}
                 latest_key_preds = {name: key_out[name].clone() for name in ("labels", "boxes", "scores")}
                 latest_key_orig_target_sizes = orig_target_sizes.clone()
                 det_count = _count_dets(key_out["scores"][0], args.score_thr)
@@ -643,7 +658,11 @@ def main():
                     "cache_content": latest_cache["cache_content"],
                     "cache_points": latest_cache["cache_points"],
                 }
-                infer_ms, nonkey_out = _timed_infer(nonkey_engine, nonkey_blob)
+                infer_ms, nonkey_out = _timed_infer(
+                    nonkey_engine,
+                    nonkey_blob,
+                    zero_copy_inputs=set(KEY_CACHE_NAMES),
+                )
                 det_count = _count_dets(nonkey_out["scores"][0], args.score_thr, args.nonkey_score)
                 out_for_eval = nonkey_out
                 eval_score_scale = args.nonkey_score
@@ -743,6 +762,7 @@ def main():
         "fps_divisor": args.fps_divisor,
         "nk_per_key": args.nk_per_key,
         "nonkey_score": args.nonkey_score,
+        "cache_zero_copy": args.mode == "knk",
         "input_h": args.input_h,
         "input_w": args.input_w,
         "combined_latency_ms": frame_stats,
