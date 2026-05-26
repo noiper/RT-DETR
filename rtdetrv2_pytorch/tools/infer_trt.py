@@ -482,8 +482,8 @@ def parse_args():
         "--mode",
         type=str,
         default="knk",
-        choices=["all_key", "knk", "reuse", "baseline"],
-        help="all_key: every evaluated frame key; knk: K+NK schedule; reuse/baseline: K+key prediction reuse",
+        choices=["all_key", "knk", "reuse"],
+        help="all_key: every evaluated frame key; knk: K+NK schedule; reuse: K+key prediction reuse",
     )
     parser.add_argument("--fps_divisor", "-k", type=int, default=1, choices=range(1, 7),
                         help="Evaluate every k-th raw frame, giving 30/k FPS for 30-FPS data")
@@ -511,8 +511,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.mode == "baseline":
-        args.mode = "reuse"
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for TensorRT inference.")
@@ -672,7 +670,7 @@ def main():
                     frame_latency_ms.append(infer_ms)
             else:
                 if latest_key_preds is None:
-                    raise RuntimeError("No key predictions available for baseline reuse mode.")
+                    raise RuntimeError("No key predictions available for reuse mode.")
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
