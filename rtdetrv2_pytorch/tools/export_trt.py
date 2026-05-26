@@ -1,5 +1,26 @@
+"""EXP 3 ONNX-to-TensorRT engine builder for Jetson batch-1 deployment.
+
+Build the key and non-key engines separately on the Jetson target:
+
+    python rtdetrv2_pytorch/tools/export_trt.py \
+      -i onnx/key_model.onnx \
+      -o engines/key_fp16.engine \
+      -m key \
+      --fp16
+
+    python rtdetrv2_pytorch/tools/export_trt.py \
+      -i onnx/nonkey_model.onnx \
+      -o engines/nonkey_fp16.engine \
+      -m nonkey \
+      --fp16
+"""
+
 import argparse
-import tensorrt as trt
+
+try:
+    import tensorrt as trt
+except ModuleNotFoundError:
+    trt = None
 
 
 def _set_workspace_size(config, workspace_mb: int):
@@ -62,6 +83,9 @@ def main(
     image_h=640,
     image_w=640,
 ):
+    if trt is None:
+        raise RuntimeError("TensorRT Python bindings are required to build engines. Run this on the Jetson target.")
+
     logger = trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.INFO)
     trt.init_libnvinfer_plugins(logger, '')
 

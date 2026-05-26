@@ -1,4 +1,18 @@
-"""Copyright(c) 2023 lyuwenyu. All Rights Reserved."""
+"""Copyright(c) 2023 lyuwenyu. All Rights Reserved.
+
+EXP 3 ONNX export for Jetson TensorRT deployment.
+
+Exports two batch-1-compatible ONNX graphs:
+  - Key graph: images + orig_target_sizes -> detections + temporal cache
+  - Non-Key graph: images + orig_target_sizes + temporal cache -> detections
+
+Example:
+    python rtdetrv2_pytorch/tools/export_onnx.py \
+      -c rtdetrv2_pytorch/configs/kndrtr/temporal_kndetr_mot17.yml \
+      -r output/phase1_mot17_skip11/06_391_717.pth \
+      --key_onnx onnx/key_model.onnx \
+      --nonkey_onnx onnx/nonkey_model.onnx
+"""
 import argparse
 import inspect
 import os

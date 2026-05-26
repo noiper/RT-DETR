@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-"""Jetson-oriented batch-1 TensorRT temporal inference on frame sequences.
+"""EXP 3 Jetson batch-1 TensorRT fixed-FPS temporal inference.
 
-Example (MOT17 image directory):
-python tools/trt_sequence_infer.py \
-  --frames_dir ~/Desktop/Projects_2025/dataset/mot17/val/MOT17-02-FRCNN/img1 \
-  --key_engine key.engine \
-  --nonkey_engine nonkey.engine \
-  --mode knk \
-  --nk_per_key 3 \
-  --num_frames 300 \
-  --power
+Supports the paper deployment schedules used by KNDETR:
+  - all_key: run the key engine on every evaluated 30/k FPS frame.
+  - knk: run K followed by m Non-Key frames using cached key tensors.
+  - reuse: run K followed by m reused key detections.
+
+Example KNDETR run:
+    python rtdetrv2_pytorch/tools/infer_trt.py \
+      --frames_dir ../dataset/mot17/val \
+      --recursive \
+      --key_engine engines/key_fp16.engine \
+      --nonkey_engine engines/nonkey_fp16.engine \
+      --mode knk \
+      -k 3 \
+      -m 2 \
+      --power \
+      --save_json output/exp3/kndetr_k3_m2.json
+
+Optional mAP:
+    add --eval_map --ann_file ../dataset/mot17/val.json --frames_root ../dataset/mot17/val
 """
 
 import argparse
+import contextlib
 import csv
+import io
 import json
 import re
 import subprocess
@@ -24,9 +36,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorrt as trt
 import torch
 from PIL import Image
+
+try:
+    import tensorrt as trt
+except ModuleNotFoundError:
+    trt = None
 
 
 KEY_CACHE_NAMES = (
@@ -40,6 +56,8 @@ KEY_CACHE_NAMES = (
 
 class TensorRTInference:
     def __init__(self, engine_path: str, device: str = "cuda:0", verbose: bool = False):
+        if trt is None:
+            raise RuntimeError("TensorRT Python bindings are required for TensorRT inference. Run this on Jetson.")
         self.device = torch.device(device)
         self.logger = trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.INFO)
         trt.init_libnvinfer_plugins(self.logger, "")
@@ -140,6 +158,8 @@ class TegrastatsMonitor:
     def __init__(self, interval_ms: int = 200):
         self.interval_ms = int(interval_ms)
         self.samples_w: List[float] = []
+        self.samples_cpu_pct: List[float] = []
+        self.samples_gpu_pct: List[float] = []
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -160,6 +180,23 @@ class TegrastatsMonitor:
             return value if unit == "W" else value / 1000.0
         return None
 
+    @staticmethod
+    def _extract_cpu_pct(line: str) -> Optional[float]:
+        match = re.search(r"CPU\s+\[([^\]]+)\]", line)
+        if not match:
+            return None
+        values = [float(v) for v in re.findall(r"(\d+(?:\.\d+)?)%@", match.group(1))]
+        if not values:
+            return None
+        return float(np.mean(np.asarray(values, dtype=np.float64)))
+
+    @staticmethod
+    def _extract_gpu_pct(line: str) -> Optional[float]:
+        match = re.search(r"GR3D_FREQ\s+(\d+(?:\.\d+)?)%", line)
+        if not match:
+            return None
+        return float(match.group(1))
+
     def _reader(self):
         assert self._proc is not None
         for line in self._proc.stdout:
@@ -168,6 +205,12 @@ class TegrastatsMonitor:
             power_w = self._extract_power_w(line)
             if power_w is not None:
                 self.samples_w.append(power_w)
+            cpu_pct = self._extract_cpu_pct(line)
+            if cpu_pct is not None:
+                self.samples_cpu_pct.append(cpu_pct)
+            gpu_pct = self._extract_gpu_pct(line)
+            if gpu_pct is not None:
+                self.samples_gpu_pct.append(gpu_pct)
 
     def start(self):
         try:
@@ -217,13 +260,43 @@ def _stats(values: List[float]) -> Dict[str, float]:
     }
 
 
-def _list_frames(frames_dir: Path, num_frames: int) -> List[Path]:
+def _list_frames(frames_dir: Path, num_frames: Optional[int], recursive: bool = False) -> List[Path]:
     exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    files = [p for p in frames_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    iterator = frames_dir.rglob("*") if recursive else frames_dir.iterdir()
+    files = [p for p in iterator if p.is_file() and p.suffix.lower() in exts]
     files.sort()
     if not files:
         raise RuntimeError(f"No image files found in {frames_dir}")
+    if num_frames is None or num_frames <= 0:
+        return files
     return files[:num_frames]
+
+
+def _extract_video_id(frame_path: Path, frames_root: Path) -> str:
+    try:
+        rel = frame_path.resolve().relative_to(frames_root.resolve())
+    except ValueError:
+        rel = frame_path
+    parts = rel.parts
+    if len(parts) > 1:
+        return parts[0]
+    return frame_path.parent.name
+
+
+def _schedule_role(raw_frame_idx: int, fps_divisor: int, nk_per_key: int, mode: str) -> Tuple[str, Optional[int]]:
+    if raw_frame_idx % fps_divisor != 0:
+        return "skip", None
+
+    eval_idx = raw_frame_idx // fps_divisor
+    if mode == "all_key":
+        return "key", eval_idx
+
+    cycle_pos = eval_idx % (nk_per_key + 1)
+    if cycle_pos == 0:
+        return "key", eval_idx
+    if mode == "knk":
+        return "nonkey", eval_idx
+    return "reuse", eval_idx
 
 
 def _preprocess_frame(
@@ -250,6 +323,112 @@ def _count_dets(scores: torch.Tensor, score_thr: float) -> int:
     # Keep postprocessing on CPU so we do not depend on PyTorch CUDA kernels.
     scores_np = scores.detach().cpu().numpy()
     return int(np.count_nonzero(scores_np > score_thr))
+
+
+def _scale_scores(output: Dict[str, torch.Tensor], score_scale: float) -> Dict[str, torch.Tensor]:
+    if score_scale == 1.0:
+        return output
+    scaled = dict(output)
+    scaled["scores"] = output["scores"] * float(score_scale)
+    return scaled
+
+
+def _scale_reuse_preds(
+    output: Dict[str, torch.Tensor],
+    source_size: Optional[torch.Tensor],
+    target_size: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    if source_size is None:
+        return output
+    scaled = dict(output)
+    # boxes: [B, N, 4] in absolute xyxy. orig_target_sizes: [B, 2] as [W, H].
+    scale_xy = target_size.to(output["boxes"].device).float() / source_size.to(output["boxes"].device).float()
+    box_scale = torch.stack(
+        [scale_xy[:, 0], scale_xy[:, 1], scale_xy[:, 0], scale_xy[:, 1]],
+        dim=1,
+    ).unsqueeze(1)
+    scaled["boxes"] = output["boxes"] * box_scale
+    return scaled
+
+
+def _format_coco_output(
+    output: Dict[str, torch.Tensor],
+    image_id: int,
+    score_scale: float = 1.0,
+) -> List[Dict]:
+    labels = output["labels"][0].detach().cpu().numpy()
+    boxes = output["boxes"][0].detach().cpu().numpy()
+    scores = output["scores"][0].detach().cpu().numpy() * float(score_scale)
+
+    results = []
+    for label, box, score in zip(labels, boxes, scores):
+        x1, y1, x2, y2 = box.tolist()
+        results.append({
+            "image_id": int(image_id),
+            "category_id": int(label),
+            "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+            "score": float(score),
+        })
+    return results
+
+
+def _load_coco_mapping(ann_file: str, frames_root: Optional[Path]):
+    from pycocotools.coco import COCO
+
+    coco_gt = COCO(ann_file)
+    by_rel = {}
+    by_name = {}
+    duplicate_names = set()
+
+    for image in coco_gt.dataset.get("images", []):
+        file_name = str(image["file_name"])
+        norm_name = Path(file_name).as_posix()
+        image_id = int(image["id"])
+        by_rel[norm_name] = image_id
+        name = Path(file_name).name
+        if name in by_name:
+            duplicate_names.add(name)
+        by_name[name] = image_id
+
+    for name in duplicate_names:
+        by_name.pop(name, None)
+
+    return coco_gt, by_rel, by_name, frames_root
+
+
+def _image_id_for_path(
+    frame_path: Path,
+    frames_root: Optional[Path],
+    by_rel: Dict[str, int],
+    by_name: Dict[str, int],
+) -> Optional[int]:
+    if frames_root is not None:
+        try:
+            rel = frame_path.resolve().relative_to(frames_root.resolve()).as_posix()
+            if rel in by_rel:
+                return by_rel[rel]
+        except ValueError:
+            pass
+    return by_rel.get(frame_path.as_posix()) or by_name.get(frame_path.name)
+
+
+def _evaluate_coco_map(coco_gt, results: List[Dict], img_ids: set) -> List[float]:
+    from pycocotools.cocoeval import COCOeval
+
+    if not results and not img_ids:
+        return [0.0] * 12
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        coco_dt = coco_gt.loadRes(results if results else [])
+        evaluator = COCOeval(coco_gt, coco_dt, "bbox")
+        evaluator.params.imgIds = sorted(list(img_ids))
+        evaluator.evaluate()
+        evaluator.accumulate()
+        evaluator.summarize()
+
+    if len(evaluator.stats) < 12:
+        return [0.0] * 12
+    return [float(v) for v in evaluator.stats]
 
 
 def _timed_infer(engine: TensorRTInference, blob: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, torch.Tensor]]:
@@ -280,24 +459,35 @@ def _write_json(path: Path, payload: Dict):
 def parse_args():
     parser = argparse.ArgumentParser(description="Batch-1 TensorRT temporal inference on frame sequence")
     parser.add_argument("--frames_dir", type=str, required=True, help="Directory of ordered frame images")
+    parser.add_argument("--recursive", action="store_true", help="Recursively collect frames under frames_dir")
+    parser.add_argument("--frames_root", type=str, default=None,
+                        help="Dataset root used to map frame paths to COCO file_name values for --eval_map")
     parser.add_argument("--key_engine", type=str, required=True, help="Path to key.engine")
     parser.add_argument("--nonkey_engine", type=str, default=None, help="Path to nonkey.engine")
     parser.add_argument(
         "--mode",
         type=str,
         default="knk",
-        choices=["all_key", "knk", "baseline"],
-        help="all_key: every frame key; knk: key + non-key; baseline: key + prediction reuse",
+        choices=["all_key", "knk", "reuse", "baseline"],
+        help="all_key: every evaluated frame key; knk: K+NK schedule; reuse/baseline: K+key prediction reuse",
     )
-    parser.add_argument("--nk_per_key", type=int, default=1, help="Non-key frames after each key frame")
-    parser.add_argument("--num_frames", type=int, default=300, help="Number of sorted frames to process")
-    parser.add_argument("--warmup", type=int, default=10, help="Exclude first N frames from metrics")
+    parser.add_argument("--fps_divisor", "-k", type=int, default=1, choices=range(1, 7),
+                        help="Evaluate every k-th raw frame, giving 30/k FPS for 30-FPS data")
+    parser.add_argument("--nk_per_key", "-m", type=int, default=1, choices=range(1, 4),
+                        help="Number of Non-Key/reuse frames after each Key frame")
+    parser.add_argument("--num_frames", type=int, default=300,
+                        help="Number of sorted raw frames to process. Use <=0 for all frames.")
+    parser.add_argument("--warmup", type=int, default=10, help="Exclude first N evaluated inferences from metrics")
     parser.add_argument("--input_h", type=int, default=640)
     parser.add_argument("--input_w", type=int, default=640)
     parser.add_argument("--score_thr", type=float, default=0.5, help="Threshold for detection count reporting")
+    parser.add_argument("--nonkey_score", "-ns", type=float, default=1.0,
+                        help="Score scale applied to non-key detections for counts and --eval_map")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--power", action="store_true", help="Measure power using tegrastats")
     parser.add_argument("--tegrastats_interval_ms", type=int, default=200)
+    parser.add_argument("--eval_map", action="store_true", help="Report COCO mAP for predicted frames")
+    parser.add_argument("--ann_file", type=str, default=None, help="COCO annotation file required for --eval_map")
     parser.add_argument("--print_every", type=int, default=50, help="Progress print interval in frames")
     parser.add_argument("--save_csv", type=str, default=None, help="Optional per-frame metrics CSV path")
     parser.add_argument("--save_json", type=str, default=None, help="Optional summary JSON path")
@@ -307,23 +497,28 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.mode == "baseline":
+        args.mode = "reuse"
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for TensorRT inference.")
     if args.mode == "knk" and not args.nonkey_engine:
         raise SystemExit("--nonkey_engine is required for --mode knk")
-    if args.nk_per_key < 1 and args.mode in {"knk", "baseline"}:
-        raise SystemExit("--nk_per_key must be >= 1 for knk/baseline modes")
-    if args.num_frames <= 0:
-        raise SystemExit("--num_frames must be > 0")
+    if args.eval_map and not args.ann_file:
+        raise SystemExit("--ann_file is required when --eval_map is enabled")
 
     frames_dir = Path(args.frames_dir).expanduser().resolve()
     if not frames_dir.exists():
         raise SystemExit(f"frames_dir does not exist: {frames_dir}")
-    frame_paths = _list_frames(frames_dir, args.num_frames)
+    frame_paths = _list_frames(frames_dir, args.num_frames, args.recursive)
+    frames_root = Path(args.frames_root).expanduser().resolve() if args.frames_root else frames_dir
 
-    print(f"[INFO] Mode={args.mode}, frames={len(frame_paths)}, warmup={args.warmup}, nk_per_key={args.nk_per_key}")
+    print(
+        f"[INFO] Mode={args.mode}, raw_frames={len(frame_paths)}, warmup={args.warmup}, "
+        f"k={args.fps_divisor}, m={args.nk_per_key}, nonkey_score={args.nonkey_score:.3f}"
+    )
     print(f"[INFO] Frames dir: {frames_dir}")
+    print(f"[INFO] Recursive: {args.recursive}")
 
     key_engine = TensorRTInference(args.key_engine, device=args.device, verbose=args.verbose_trt)
     key_engine.validate_bindings(
@@ -341,6 +536,17 @@ def main():
             tag="Non-key",
         )
 
+    coco_gt = None
+    coco_by_rel = {}
+    coco_by_name = {}
+    coco_results: List[Dict] = []
+    coco_img_ids = set()
+    missing_map_frames = 0
+    if args.eval_map:
+        coco_gt, coco_by_rel, coco_by_name, frames_root = _load_coco_mapping(args.ann_file, frames_root)
+        print(f"[INFO] COCO mAP enabled. Annotation file: {args.ann_file}")
+        print(f"[INFO] COCO frame root: {frames_root}")
+
     power_monitor = TegrastatsMonitor(args.tegrastats_interval_ms) if args.power else None
     if power_monitor is not None:
         power_monitor.start()
@@ -350,26 +556,65 @@ def main():
     frame_latency_ms: List[float] = []
     key_latency_ms: List[float] = []
     nonkey_latency_ms: List[float] = []
+    reuse_latency_ms: List[float] = []
     rows: List[Dict] = []
 
     latest_cache: Optional[Dict[str, torch.Tensor]] = None
     latest_key_preds: Optional[Dict[str, torch.Tensor]] = None
-    cycle_len = args.nk_per_key + 1
+    latest_key_orig_target_sizes: Optional[torch.Tensor] = None
+    raw_frame_idx = 0
+    executed_idx = 0
+    skipped_frames = 0
+    key_frames = 0
+    nonkey_frames = 0
+    reuse_frames = 0
+    last_video_id = None
+    wall_t0 = time.perf_counter()
 
     try:
         for i, frame_path in enumerate(frame_paths):
+            current_video_id = _extract_video_id(frame_path, frames_root)
+            if last_video_id is not None and current_video_id != last_video_id:
+                raw_frame_idx = 0
+                latest_cache = None
+                latest_key_preds = None
+                latest_key_orig_target_sizes = None
+            last_video_id = current_video_id
+
+            role, eval_idx = _schedule_role(raw_frame_idx, args.fps_divisor, args.nk_per_key, args.mode)
+            if role == "skip":
+                skipped_frames += 1
+                rows.append(
+                    {
+                        "raw_index_global": i,
+                        "raw_index_video": raw_frame_idx,
+                        "eval_index_video": "",
+                        "frame_name": frame_path.name,
+                        "frame_path": str(frame_path),
+                        "video_id": current_video_id,
+                        "image_id": "",
+                        "role": "skip",
+                        "inference_ms": 0.0,
+                        "detections_over_thr": 0,
+                        "is_warmup": 0,
+                    }
+                )
+                raw_frame_idx += 1
+                continue
+
             images, orig_target_sizes = _preprocess_frame(
                 frame_path, args.input_h, args.input_w, key_engine.device
             )
-            measured = i >= args.warmup
-            step = i % cycle_len
+            measured = executed_idx >= args.warmup
 
-            role = "key"
             infer_ms = 0.0
             det_count = 0
+            out_for_eval: Optional[Dict[str, torch.Tensor]] = None
+            coco_image_id = None
+            if args.eval_map:
+                coco_image_id = _image_id_for_path(frame_path, frames_root, coco_by_rel, coco_by_name)
 
-            run_key = args.mode == "all_key" or step == 0
-            if run_key:
+            if role == "key":
                 key_blob = {
                     "images": images,
                     "orig_target_sizes": orig_target_sizes,
@@ -377,8 +622,10 @@ def main():
                 infer_ms, key_out = _timed_infer(key_engine, key_blob)
                 latest_cache = {name: key_out[name].clone() for name in KEY_CACHE_NAMES}
                 latest_key_preds = {name: key_out[name].clone() for name in ("labels", "boxes", "scores")}
+                latest_key_orig_target_sizes = orig_target_sizes.clone()
                 det_count = _count_dets(key_out["scores"][0], args.score_thr)
-                role = "key"
+                out_for_eval = key_out
+                key_frames += 1
                 if measured:
                     key_latency_ms.append(infer_ms)
                     frame_latency_ms.append(infer_ms)
@@ -397,74 +644,146 @@ def main():
                     "cache_points": latest_cache["cache_points"],
                 }
                 infer_ms, nonkey_out = _timed_infer(nonkey_engine, nonkey_blob)
-                det_count = _count_dets(nonkey_out["scores"][0], args.score_thr)
-                role = "nonkey"
+                scaled_nonkey_out = _scale_scores(nonkey_out, args.nonkey_score)
+                det_count = _count_dets(scaled_nonkey_out["scores"][0], args.score_thr)
+                out_for_eval = scaled_nonkey_out
+                nonkey_frames += 1
                 if measured:
                     nonkey_latency_ms.append(infer_ms)
                     frame_latency_ms.append(infer_ms)
             else:
                 if latest_key_preds is None:
                     raise RuntimeError("No key predictions available for baseline reuse mode.")
-                role = "reuse"
-                infer_ms = 0.0
-                det_count = _count_dets(latest_key_preds["scores"][0], args.score_thr)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                reuse_out = _scale_reuse_preds(latest_key_preds, latest_key_orig_target_sizes, orig_target_sizes)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                infer_ms = (t1 - t0) * 1000.0
+                det_count = _count_dets(reuse_out["scores"][0], args.score_thr)
+                out_for_eval = reuse_out
+                reuse_frames += 1
                 if measured:
+                    reuse_latency_ms.append(infer_ms)
                     frame_latency_ms.append(infer_ms)
+
+            if args.eval_map and out_for_eval is not None:
+                if coco_image_id is None:
+                    missing_map_frames += 1
+                else:
+                    coco_results.extend(_format_coco_output(out_for_eval, coco_image_id))
+                    coco_img_ids.add(coco_image_id)
 
             rows.append(
                 {
-                    "frame_idx": i,
+                    "raw_index_global": i,
+                    "raw_index_video": raw_frame_idx,
+                    "eval_index_video": eval_idx,
                     "frame_name": frame_path.name,
+                    "frame_path": str(frame_path),
+                    "video_id": current_video_id,
+                    "image_id": "" if coco_image_id is None else coco_image_id,
                     "role": role,
                     "inference_ms": round(infer_ms, 6),
                     "detections_over_thr": det_count,
                     "is_warmup": int(not measured),
                 }
             )
+            executed_idx += 1
+            raw_frame_idx += 1
             if args.print_every > 0 and ((i + 1) % args.print_every == 0 or (i + 1) == len(frame_paths)):
                 print(f"[INFO] Processed {i + 1}/{len(frame_paths)} frames")
     finally:
         if power_monitor is not None:
             power_monitor.stop()
+    wall_t1 = time.perf_counter()
 
-    measured_frames = max(0, len(frame_paths) - args.warmup)
+    measured_frames = len(frame_latency_ms)
     total_infer_s = float(sum(frame_latency_ms) / 1000.0)
     fps = (measured_frames / total_infer_s) if total_infer_s > 0 else 0.0
 
     frame_stats = _stats(frame_latency_ms)
     key_stats = _stats(key_latency_ms)
     nonkey_stats = _stats(nonkey_latency_ms)
+    reuse_stats = _stats(reuse_latency_ms)
 
     avg_power_w = 0.0
-    energy_per_frame_j = 0.0
+    avg_cpu_pct = 0.0
+    avg_gpu_pct = 0.0
+    energy_per_inference_j = 0.0
     power_samples = 0
+    cpu_samples = 0
+    gpu_samples = 0
     if power_monitor is not None and power_monitor.available and power_monitor.samples_w:
         avg_power_w = float(np.mean(np.asarray(power_monitor.samples_w, dtype=np.float64)))
         power_samples = len(power_monitor.samples_w)
-        energy_per_frame_j = (avg_power_w * total_infer_s / measured_frames) if measured_frames > 0 else 0.0
+        energy_per_inference_j = (avg_power_w * total_infer_s / measured_frames) if measured_frames > 0 else 0.0
+    if power_monitor is not None and power_monitor.available and power_monitor.samples_cpu_pct:
+        avg_cpu_pct = float(np.mean(np.asarray(power_monitor.samples_cpu_pct, dtype=np.float64)))
+        cpu_samples = len(power_monitor.samples_cpu_pct)
+    if power_monitor is not None and power_monitor.available and power_monitor.samples_gpu_pct:
+        avg_gpu_pct = float(np.mean(np.asarray(power_monitor.samples_gpu_pct, dtype=np.float64)))
+        gpu_samples = len(power_monitor.samples_gpu_pct)
+
+    coco_stats = None
+    if args.eval_map:
+        if missing_map_frames > 0:
+            print(f"[WARN] {missing_map_frames} predicted frames could not be mapped to COCO image IDs.")
+        coco_stats = _evaluate_coco_map(coco_gt, coco_results, coco_img_ids)
 
     summary = {
         "mode": args.mode,
-        "frames_total": len(frame_paths),
-        "frames_measured": measured_frames,
+        "raw_frames_total": len(frame_paths),
+        "raw_frames_skipped": skipped_frames,
+        "evaluated_frames_total": executed_idx,
+        "evaluated_frames_measured": measured_frames,
         "warmup": args.warmup,
+        "fps_divisor": args.fps_divisor,
         "nk_per_key": args.nk_per_key,
+        "nonkey_score": args.nonkey_score,
         "input_h": args.input_h,
         "input_w": args.input_w,
-        "frame_latency_ms": frame_stats,
+        "combined_latency_ms": frame_stats,
         "key_latency_ms": key_stats,
         "nonkey_latency_ms": nonkey_stats,
+        "reuse_latency_ms": reuse_stats,
+        "key_frames": key_frames,
+        "nonkey_frames": nonkey_frames,
+        "reuse_frames": reuse_frames,
         "fps_inference_only": fps,
+        "wall_time_s": float(wall_t1 - wall_t0),
         "power_avg_w": avg_power_w,
         "power_samples": power_samples,
-        "energy_per_frame_j": energy_per_frame_j,
+        "cpu_util_avg_pct": avg_cpu_pct,
+        "cpu_samples": cpu_samples,
+        "gpu_util_avg_pct": avg_gpu_pct,
+        "gpu_samples": gpu_samples,
+        "energy_per_inference_j": energy_per_inference_j,
     }
+    if coco_stats is not None:
+        summary["coco_eval"] = {
+            "map": coco_stats[0],
+            "map50": coco_stats[1],
+            "map75": coco_stats[2],
+            "map_s": coco_stats[3],
+            "map_m": coco_stats[4],
+            "map_l": coco_stats[5],
+            "evaluated_image_ids": len(coco_img_ids),
+            "detections": len(coco_results),
+            "missing_mapped_frames": missing_map_frames,
+        }
 
     print("\n================ SUMMARY ================")
     print(f"Mode: {args.mode}")
-    print(f"Frames: total={len(frame_paths)}, measured={measured_frames}, warmup={args.warmup}")
     print(
-        f"Frame latency (ms): avg={frame_stats['avg_ms']:.3f}, "
+        f"Raw frames: total={len(frame_paths)}, skipped={skipped_frames}; "
+        f"evaluated={executed_idx}, measured={measured_frames}, warmup={args.warmup}"
+    )
+    print(f"Schedule: k={args.fps_divisor} (30/{args.fps_divisor} FPS), m={args.nk_per_key}")
+    print(
+        f"Combined latency/inference (ms): avg={frame_stats['avg_ms']:.3f}, "
         f"p50={frame_stats['p50_ms']:.3f}, p95={frame_stats['p95_ms']:.3f}"
     )
     print(
@@ -476,15 +795,33 @@ def main():
             f"Non-key lat.  (ms): avg={nonkey_stats['avg_ms']:.3f}, "
             f"p50={nonkey_stats['p50_ms']:.3f}, p95={nonkey_stats['p95_ms']:.3f}"
         )
+    if args.mode == "reuse":
+        print(
+            f"Reuse latency (ms): avg={reuse_stats['avg_ms']:.3f}, "
+            f"p50={reuse_stats['p50_ms']:.3f}, p95={reuse_stats['p95_ms']:.3f}"
+        )
     print(f"Inference-only FPS: {fps:.3f}")
     if args.power:
-        if power_samples > 0:
+        if power_samples > 0 or cpu_samples > 0 or gpu_samples > 0:
             print(
                 f"Power avg (W): {avg_power_w:.3f} (samples={power_samples}), "
-                f"Energy/frame (J): {energy_per_frame_j:.5f}"
+                f"Energy/inference (J): {energy_per_inference_j:.5f}"
+            )
+            print(
+                f"CPU util avg (%): {avg_cpu_pct:.2f} (samples={cpu_samples}), "
+                f"GPU util avg (%): {avg_gpu_pct:.2f} (samples={gpu_samples})"
             )
         else:
-            print("Power avg (W): unavailable (tegrastats missing or no samples parsed)")
+            print("Power/utilization unavailable (tegrastats missing or no samples parsed)")
+    if coco_stats is not None:
+        print(
+            f"COCO mAP: {coco_stats[0]:.4f} | mAP50: {coco_stats[1]:.4f} | "
+            f"mAP75: {coco_stats[2]:.4f}"
+        )
+        print(
+            f"COCO mAP_s: {coco_stats[3]:.4f} | mAP_m: {coco_stats[4]:.4f} | "
+            f"mAP_l: {coco_stats[5]:.4f}"
+        )
     print("=========================================\n")
 
     if args.save_csv:
