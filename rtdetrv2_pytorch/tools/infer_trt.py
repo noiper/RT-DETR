@@ -319,18 +319,10 @@ def _preprocess_frame(
     return images, orig_target_sizes
 
 
-def _count_dets(scores: torch.Tensor, score_thr: float) -> int:
+def _count_dets(scores: torch.Tensor, score_thr: float, score_scale: float = 1.0) -> int:
     # Keep postprocessing on CPU so we do not depend on PyTorch CUDA kernels.
-    scores_np = scores.detach().cpu().numpy()
+    scores_np = scores.detach().cpu().numpy() * float(score_scale)
     return int(np.count_nonzero(scores_np > score_thr))
-
-
-def _scale_scores(output: Dict[str, torch.Tensor], score_scale: float) -> Dict[str, torch.Tensor]:
-    if score_scale == 1.0:
-        return output
-    scaled = dict(output)
-    scaled["scores"] = output["scores"] * float(score_scale)
-    return scaled
 
 
 def _scale_reuse_preds(
@@ -338,16 +330,23 @@ def _scale_reuse_preds(
     source_size: Optional[torch.Tensor],
     target_size: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
+    scaled = {
+        "labels": output["labels"].detach().cpu().clone(),
+        "boxes": output["boxes"].detach().cpu().clone(),
+        "scores": output["scores"].detach().cpu().clone(),
+    }
     if source_size is None:
-        return output
-    scaled = dict(output)
+        return scaled
+
     # boxes: [B, N, 4] in absolute xyxy. orig_target_sizes: [B, 2] as [W, H].
-    scale_xy = target_size.to(output["boxes"].device).float() / source_size.to(output["boxes"].device).float()
+    source_size_cpu = source_size.detach().cpu().float()
+    target_size_cpu = target_size.detach().cpu().float()
+    scale_xy = target_size_cpu / source_size_cpu
     box_scale = torch.stack(
         [scale_xy[:, 0], scale_xy[:, 1], scale_xy[:, 0], scale_xy[:, 1]],
         dim=1,
     ).unsqueeze(1)
-    scaled["boxes"] = output["boxes"] * box_scale
+    scaled["boxes"] = scaled["boxes"] * box_scale
     return scaled
 
 
@@ -458,12 +457,12 @@ def _write_json(path: Path, payload: Dict):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Batch-1 TensorRT temporal inference on frame sequence")
-    parser.add_argument("--frames_dir", type=str, required=True, help="Directory of ordered frame images")
+    parser.add_argument("--frames_dir", type=str, default="../dataset/mot17/val", help="Directory of ordered frame images")
     parser.add_argument("--recursive", action="store_true", help="Recursively collect frames under frames_dir")
     parser.add_argument("--frames_root", type=str, default=None,
                         help="Dataset root used to map frame paths to COCO file_name values for --eval_map")
-    parser.add_argument("--key_engine", type=str, required=True, help="Path to key.engine")
-    parser.add_argument("--nonkey_engine", type=str, default=None, help="Path to nonkey.engine")
+    parser.add_argument("--key_engine", type=str, default="engines/key_fp16.engine", help="Path to key.engine")
+    parser.add_argument("--nonkey_engine", type=str, default="engines/nonkey_fp16.engine", help="Path to nonkey.engine")
     parser.add_argument(
         "--mode",
         type=str,
@@ -610,6 +609,7 @@ def main():
             infer_ms = 0.0
             det_count = 0
             out_for_eval: Optional[Dict[str, torch.Tensor]] = None
+            eval_score_scale = 1.0
             coco_image_id = None
             if args.eval_map:
                 coco_image_id = _image_id_for_path(frame_path, frames_root, coco_by_rel, coco_by_name)
@@ -644,9 +644,9 @@ def main():
                     "cache_points": latest_cache["cache_points"],
                 }
                 infer_ms, nonkey_out = _timed_infer(nonkey_engine, nonkey_blob)
-                scaled_nonkey_out = _scale_scores(nonkey_out, args.nonkey_score)
-                det_count = _count_dets(scaled_nonkey_out["scores"][0], args.score_thr)
-                out_for_eval = scaled_nonkey_out
+                det_count = _count_dets(nonkey_out["scores"][0], args.score_thr, args.nonkey_score)
+                out_for_eval = nonkey_out
+                eval_score_scale = args.nonkey_score
                 nonkey_frames += 1
                 if measured:
                     nonkey_latency_ms.append(infer_ms)
@@ -673,7 +673,7 @@ def main():
                 if coco_image_id is None:
                     missing_map_frames += 1
                 else:
-                    coco_results.extend(_format_coco_output(out_for_eval, coco_image_id))
+                    coco_results.extend(_format_coco_output(out_for_eval, coco_image_id, eval_score_scale))
                     coco_img_ids.add(coco_image_id)
 
             rows.append(
