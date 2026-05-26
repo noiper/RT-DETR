@@ -489,7 +489,7 @@ def parse_args():
                         help="Evaluate every k-th raw frame, giving 30/k FPS for 30-FPS data")
     parser.add_argument("--nk_per_key", "-m", type=int, default=1, choices=range(1, 4),
                         help="Number of Non-Key/reuse frames after each Key frame")
-    parser.add_argument("--num_frames", type=int, default=300,
+    parser.add_argument("--num_frames", type=int, default=0,
                         help="Number of sorted raw frames to process. Use <=0 for all frames.")
     parser.add_argument("--warmup", type=int, default=10, help="Exclude first N evaluated inferences from metrics")
     parser.add_argument("--input_h", type=int, default=640)
