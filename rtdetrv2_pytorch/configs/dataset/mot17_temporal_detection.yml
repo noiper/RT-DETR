@@ -13,13 +13,13 @@ train_dataloader:
     type: TemporalVideoDataset
     root_dir: ../dataset/mot17/train/
     ann_file: ../dataset/mot17/train.json
-    max_frame_gap: 6
+    max_frame_gap: 18
     pair_sampling_strategy: "fixed_gap"
     frame_stride: 1
     transforms:
       type: Compose
       ops:
-        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomPhotometricDistort, p: 0.5, hue: [0, 0]}
         - {type: RandomZoomOut, fill: 0}
         - {type: RandomIoUCrop, p: 0.8}
         - {type: SanitizeBoundingBoxes, min_size: 1}
@@ -45,9 +45,9 @@ val_dataloader:
     type: TemporalVideoDataset
     root_dir: ../dataset/mot17/val/
     ann_file: ../dataset/mot17/val.json
-    max_frame_gap: 6
+    max_frame_gap: 18
     pair_sampling_strategy: "fixed_gap"
-    frame_stride: 12
+    frame_stride: 36
     transforms:
       type: Compose
       ops: 
