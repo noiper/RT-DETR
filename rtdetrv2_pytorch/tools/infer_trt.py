@@ -480,7 +480,7 @@ def parse_args():
     parser.add_argument("--input_h", type=int, default=640)
     parser.add_argument("--input_w", type=int, default=640)
     parser.add_argument("--score_thr", type=float, default=0.5, help="Threshold for detection count reporting")
-    parser.add_argument("--nonkey_score", "-ns", type=float, default=1.0,
+    parser.add_argument("--nonkey_score", "-ns", type=float, default=1.05,
                         help="Score scale applied to non-key detections for counts and --eval_map")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--power", action="store_true", help="Measure power using tegrastats")
