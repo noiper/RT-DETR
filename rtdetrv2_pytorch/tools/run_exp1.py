@@ -28,35 +28,75 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
-import torch
-from tqdm import tqdm
-
 # Ensure python path is correct when run from terminal.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-
-from src.core import YAMLConfig
-from temporal_eval_utils import evaluate_map, scale_results
-from eval_temporal_low_rate import extract_video_id, format_coco
-from eval_temporal_fixed_fps import (
-    build_temporal_model,
-    get_schedule_role,
-    load_weights,
-    rebuild_val_loader,
-)
 
 
 FPS_DIVISORS = [1, 2, 3, 4, 5, 6]
 NK_PER_KEY_VALUES = [1, 2, 3]
 DEFAULT_NS_GRID = [1.03, 1.04, 1.05, 1.06, 1.07, 1.08]
+DISPLAY_METHOD_NAMES = {
+    'KNDETR': 'KN-DETR',
+}
+
+# Paper plot formatting knobs. Edit these and rerun with --plot_only.
+PLOT_TICK_FONTSIZE = 10
+PLOT_TEXT_SCALE = 1.5
+# Subplot size
+PLOT_SUBPLOT_WIDTH = 4.5
+PLOT_FIG_HEIGHT = 4.5
+
+PLOT_SUBPLOT_W_PAD = 2.0  # Space between the two panels.
+PLOT_AXIS_LABEL_PAD = 5.0  # Space between axis labels and tick labels.
+PLOT_TITLE_PAD = 8.0
+PLOT_LEGEND_Y = 0  # Bottom legend row. Higher moves both rows closer to the plots.
+PLOT_LEGEND_ROW_GAP = 0.07  # Vertical gap between the two legend rows.
+PLOT_KNDETR_LEGEND_X_MARGIN = 0.18  # Decrease to spread the bottom legend row wider.
+PLOT_LAYOUT_BOTTOM = 0.18  # Bottom space reserved for x labels plus legend.
+PLOT_BORDER = 0.02  # Saved-image border in inches on all sides.
+
+CSV_INT_FIELDS = {'m', 'k'}
+CSV_FLOAT_FIELDS = {
+    'input_fps',
+    'ns',
+    'map',
+    'map50',
+    'map75',
+    'map_s',
+    'map_m',
+    'map_l',
+    'ap_retention',
+    'ap50_retention',
+    'avg_retention',
+}
+
+
+def load_eval_dependencies():
+    global np, torch, tqdm, YAMLConfig, evaluate_map, scale_results
+    global extract_video_id, format_coco
+    global build_temporal_model, get_schedule_role, load_weights, rebuild_val_loader
+
+    import numpy as np
+    import torch
+    from tqdm import tqdm
+
+    from src.core import YAMLConfig
+    from temporal_eval_utils import evaluate_map, scale_results
+    from eval_temporal_low_rate import extract_video_id, format_coco
+    from eval_temporal_fixed_fps import (
+        build_temporal_model,
+        get_schedule_role,
+        load_weights,
+        rebuild_val_loader,
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="EXP 1: combined stream AP/AP50 sweep over fixed-FPS K/NK schedules"
     )
-    parser.add_argument('--config', '-c', type=str, required=True, help='Path to config yml')
-    parser.add_argument('--weights', '-w', type=str, required=True, help='Path to checkpoint .pth file')
+    parser.add_argument('--config', '-c', type=str, help='Path to config yml')
+    parser.add_argument('--weights', '-w', type=str, help='Path to checkpoint .pth file')
     parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0,
                         help='Fixed non-key score scale when --tune_score is not used')
     parser.add_argument('--tune_score', '-ts', action='store_true',
@@ -68,7 +108,20 @@ def parse_args():
     parser.add_argument('--no_plot', action='store_true', help='Skip PNG plot generation')
     parser.add_argument('--batch', action='store_true',
                         help='Use batch_size=16 dataloader mode; inference still runs per stream sample')
-    return parser.parse_args()
+    parser.add_argument('--plot_only', action='store_true',
+                        help='Regenerate the PNG plot from a saved metrics.csv without running inference')
+    parser.add_argument('--metrics_csv', type=str,
+                        help='Saved metrics CSV used with --plot_only. Default: <output_dir>/metrics.csv')
+    args = parser.parse_args()
+
+    if args.plot_only and args.no_plot:
+        parser.error('--plot_only cannot be combined with --no_plot')
+    if not args.plot_only:
+        if args.config is None:
+            parser.error('--config is required unless --plot_only is used')
+        if args.weights is None:
+            parser.error('--weights is required unless --plot_only is used')
+    return args
 
 
 def reset_temporal_cache(model):
@@ -172,7 +225,7 @@ def run_all_key_reference(model, val_dataloader, postprocessor, device):
 
 
 def run_schedule(model, val_dataloader, postprocessor, device, fps_divisor, nk_per_key):
-    """Run one K+m*NK schedule and collect raw KNDETR plus Key-Reuse detections."""
+    """Run one K+m*NK schedule and collect raw KN-DETR plus Key-Reuse detections."""
     reset_temporal_cache(model)
     result = {
         'k': fps_divisor,
@@ -188,7 +241,7 @@ def run_schedule(model, val_dataloader, postprocessor, device, fps_divisor, nk_p
     last_video_id = None
     latest_key_results_norm = None
 
-    desc = f"KNDETR k={fps_divisor}, m={nk_per_key}"
+    desc = f"KN-DETR k={fps_divisor}, m={nk_per_key}"
     with torch.no_grad():
         for img, target in tqdm(iter_stream_samples(val_dataloader), desc=desc):
             current_video_id = get_video_id(val_dataloader, target[0])
@@ -277,6 +330,25 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def load_metrics_csv(path):
+    rows = []
+    with path.open(newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed = {}
+            for key, value in row.items():
+                if value == '':
+                    parsed[key] = None
+                elif key in CSV_INT_FIELDS:
+                    parsed[key] = int(value)
+                elif key in CSV_FLOAT_FIELDS:
+                    parsed[key] = float(value)
+                else:
+                    parsed[key] = value
+            rows.append(parsed)
+    return rows
+
+
 def write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('w') as f:
@@ -289,7 +361,13 @@ def plot_metrics(rows, output_path):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
+    text_fontsize = PLOT_TICK_FONTSIZE * PLOT_TEXT_SCALE
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(PLOT_SUBPLOT_WIDTH * 2, PLOT_FIG_HEIGHT),
+        sharex=True,
+    )
     series_specs = [
         ('All-Key', None, 'black', '-', 'o'),
         ('Key-Reuse', 1, '#8c8c8c', '--', 's'),
@@ -305,12 +383,13 @@ def plot_metrics(rows, output_path):
         ]
         return sorted(selected, key=lambda row: row['input_fps'])
 
-    for ax, metric_key, title in zip(axes, ['map', 'map50'], ['mAP vs Input FPS', 'mAP50 vs Input FPS']):
+    for ax, metric_key, title in zip(axes, ['map', 'map50'], ['(a)', '(b)']):
         for method, m, color, linestyle, marker in series_specs:
             selected = select_rows(method, m)
             if not selected:
                 continue
-            label = method if m is None else f"{method} m={m}"
+            display_method = DISPLAY_METHOD_NAMES.get(method, method)
+            label = display_method if m is None else f"{display_method} m={m}"
             ax.plot(
                 [row['input_fps'] for row in selected],
                 [row[metric_key] for row in selected],
@@ -321,17 +400,47 @@ def plot_metrics(rows, output_path):
                 markersize=5,
                 label=label,
             )
-        ax.set_title(title)
-        ax.set_xlabel('Input FPS')
+        ax.set_title(title, pad=PLOT_TITLE_PAD, fontsize=text_fontsize)
+        ax.set_xlabel('Input FPS', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
+        ax.tick_params(axis='both', labelsize=PLOT_TICK_FONTSIZE)
         ax.grid(True, linestyle=':', linewidth=0.8, alpha=0.7)
 
-    axes[0].set_ylabel('AP')
-    axes[1].set_ylabel('AP50')
+    axes[0].set_ylabel('mAP', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
+    axes[1].set_ylabel('mAP50', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=4, frameon=False)
-    fig.tight_layout(rect=[0, 0.16, 1, 1])
+    legend_entries = dict(zip(labels, handles))
+    baseline_labels = [label for label in labels if not label.startswith('KN-DETR')]
+    kndetr_labels = [label for label in labels if label.startswith('KN-DETR')]
+
+    def add_evenly_spaced_legend_row(row_labels, y, x_margin=None):
+        # Default centers at 1/(n+1), 2/(n+1), ... so each row centers independently.
+        if not row_labels:
+            return
+        for idx, label in enumerate(row_labels):
+            if x_margin is None:
+                x = (idx + 1) / (len(row_labels) + 1)
+            elif len(row_labels) == 1:
+                x = 0.5
+            else:
+                x = x_margin + idx * ((1.0 - 2.0 * x_margin) / (len(row_labels) - 1))
+            fig.legend(
+                [legend_entries[label]],
+                [label],
+                loc='lower center',
+                bbox_to_anchor=(x, y),
+                frameon=False,
+                fontsize=text_fontsize,
+            )
+
+    add_evenly_spaced_legend_row(baseline_labels, PLOT_LEGEND_Y + PLOT_LEGEND_ROW_GAP)
+    add_evenly_spaced_legend_row(kndetr_labels, PLOT_LEGEND_Y, PLOT_KNDETR_LEGEND_X_MARGIN)
+    fig.tight_layout(rect=[0, PLOT_LAYOUT_BOTTOM, 1, 1],
+                     w_pad=PLOT_SUBPLOT_W_PAD, pad=PLOT_BORDER)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=300)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    tight_bbox = fig.get_tightbbox(renderer, bbox_extra_artists=fig.legends).padded(PLOT_BORDER)
+    fig.savefig(output_path, dpi=300, bbox_inches=tight_bbox)
     plt.close(fig)
 
 
@@ -339,7 +448,16 @@ def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = output_dir / 'map_map50_vs_fps.png'
 
+    if args.plot_only:
+        metrics_csv = Path(args.metrics_csv) if args.metrics_csv else output_dir / 'metrics.csv'
+        rows = load_metrics_csv(metrics_csv)
+        plot_metrics(rows, plot_path)
+        print(f"Wrote plot: {plot_path}")
+        return
+
+    load_eval_dependencies()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Deployment Device: {device}")
     if args.tune_score:
@@ -422,7 +540,6 @@ def main():
     metrics_csv = output_dir / 'metrics.csv'
     ns_sweep_csv = output_dir / 'ns_sweep.csv'
     summary_json = output_dir / 'summary.json'
-    plot_path = output_dir / 'map_map50_vs_fps.png'
 
     write_csv(metrics_csv, final_rows)
     write_csv(ns_sweep_csv, candidate_rows)
