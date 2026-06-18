@@ -185,6 +185,7 @@ rtdetrv2_pytorch/dataset/
 
 # Ignore all training outputs and saved models
 output/
+runs/
 models/
 onnx/
 
