@@ -171,6 +171,7 @@ __pycache__/
 
 .DS_Store
 *.ipynb
+*.pt
 *.pth 
 *.pdparams
 *.onnx

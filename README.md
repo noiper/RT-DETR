@@ -70,3 +70,10 @@ Optional score tuning:
 ```bash
 --tune_score
 ```
+
+## YOLO26 All-Key Baseline
+
+For a non-temporal YOLO26 baseline that runs the detector on every evaluated
+frame, see [docs/yolo26_all_key.md](docs/yolo26_all_key.md). The workflow
+converts the existing COCO-format MOT17/VIRAT annotations to Ultralytics YOLO
+format, fine-tunes `yolo26*.pt`, and runs All-Key validation or inference.

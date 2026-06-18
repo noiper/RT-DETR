@@ -54,6 +54,7 @@ PLOT_LEGEND_ROW_GAP = 0.07  # Vertical gap between the two legend rows.
 PLOT_KNDETR_LEGEND_X_MARGIN = 0.18  # Decrease to spread the bottom legend row wider.
 PLOT_LAYOUT_BOTTOM = 0.18  # Bottom space reserved for x labels plus legend.
 PLOT_BORDER = 0.02  # Saved-image border in inches on all sides.
+PLOT_AP_PERCENT_SCALE = 100.0
 
 CSV_INT_FIELDS = {'m', 'k'}
 CSV_FLOAT_FIELDS = {
@@ -392,7 +393,7 @@ def plot_metrics(rows, output_path):
             label = display_method if m is None else f"{display_method} m={m}"
             ax.plot(
                 [row['input_fps'] for row in selected],
-                [row[metric_key] for row in selected],
+                [row[metric_key] * PLOT_AP_PERCENT_SCALE for row in selected],
                 color=color,
                 linestyle=linestyle,
                 marker=marker,
@@ -405,8 +406,8 @@ def plot_metrics(rows, output_path):
         ax.tick_params(axis='both', labelsize=PLOT_TICK_FONTSIZE)
         ax.grid(True, linestyle=':', linewidth=0.8, alpha=0.7)
 
-    axes[0].set_ylabel('mAP', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
-    axes[1].set_ylabel('mAP50', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
+    axes[0].set_ylabel('AP (%)', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
+    axes[1].set_ylabel('AP50 (%)', fontsize=text_fontsize, labelpad=PLOT_AXIS_LABEL_PAD)
     handles, labels = axes[0].get_legend_handles_labels()
     legend_entries = dict(zip(labels, handles))
     baseline_labels = [label for label in labels if not label.startswith('KN-DETR')]
