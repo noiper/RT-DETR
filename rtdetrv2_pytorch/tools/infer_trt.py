@@ -10,8 +10,8 @@ Example KNDETR run:
     python rtdetrv2_pytorch/tools/infer_trt.py \
       --frames_dir ../dataset/mot17/val \
       --recursive \
-      --key_engine engines/key_fp16.engine \
-      --nonkey_engine engines/nonkey_fp16.engine \
+      --key_engine engines/key_fp32.engine \
+      --nonkey_engine engines/nonkey_fp32.engine \
       --mode knk \
       -k 3 \
       -m 2 \
@@ -19,7 +19,7 @@ Example KNDETR run:
       --save_json output/exp3/kndetr_k3_m2.json
 
 Optional mAP:
-    add --eval_map --ann_file ../dataset/mot17/val.json --frames_root ../dataset/mot17/val
+    add --map --ann_file ../dataset/mot17/val.json --frames_root ../dataset/mot17/val
 """
 
 import argparse
@@ -476,8 +476,8 @@ def parse_args():
     parser.add_argument("--recursive", action="store_true", help="Recursively collect frames under frames_dir")
     parser.add_argument("--frames_root", type=str, default=None,
                         help="Dataset root used to map frame paths to COCO file_name values for --eval_map")
-    parser.add_argument("--key_engine", type=str, default="engines/key_fp16.engine", help="Path to key.engine")
-    parser.add_argument("--nonkey_engine", type=str, default="engines/nonkey_fp16.engine", help="Path to nonkey.engine")
+    parser.add_argument("--key_engine", type=str, default="engines/key_fp32.engine", help="Path to key.engine")
+    parser.add_argument("--nonkey_engine", type=str, default="engines/nonkey_fp32.engine", help="Path to nonkey.engine")
     parser.add_argument(
         "--mode",
         type=str,
@@ -500,7 +500,12 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--power", action="store_true", help="Measure power using tegrastats")
     parser.add_argument("--tegrastats_interval_ms", type=int, default=200)
-    parser.add_argument("--eval_map", action="store_true", help="Report COCO mAP for predicted frames")
+    parser.add_argument(
+        "--eval_map", "--map",
+        dest="eval_map",
+        action="store_true",
+        help="Report COCO mAP for predicted frames. By default, only inference metrics are reported.",
+    )
     parser.add_argument("--ann_file", type=str, default=None, help="COCO annotation file required for --eval_map")
     parser.add_argument("--print_every", type=int, default=50, help="Progress print interval in frames")
     parser.add_argument("--save_csv", type=str, default=None, help="Optional per-frame metrics CSV path")

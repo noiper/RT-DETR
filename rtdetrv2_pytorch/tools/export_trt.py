@@ -4,15 +4,15 @@ Build the key and non-key engines separately on the Jetson target:
 
     python rtdetrv2_pytorch/tools/export_trt.py \
       -i onnx/key_model.onnx \
-      -o engines/key_fp16.engine \
-      -m key \
-      --fp16
+      -o engines/key_fp32.engine \
+      -m key
 
     python rtdetrv2_pytorch/tools/export_trt.py \
       -i onnx/nonkey_model.onnx \
-      -o engines/nonkey_fp16.engine \
-      -m nonkey \
-      --fp16
+      -o engines/nonkey_fp32.engine \
+      -m nonkey
+
+FP16 is opt-in. Add --fp16 only for explicit reduced-precision experiments.
 """
 
 import argparse
@@ -77,7 +77,7 @@ def main(
     max_batchsize,
     opt_batchsize,
     min_batchsize,
-    use_fp16=True,
+    use_fp16=False,
     verbose=False,
     workspace_mb=1024,
     image_h=640,
@@ -113,6 +113,8 @@ def main(
         print("[INFO] FP16 optimization enabled.")
     elif use_fp16:
         print("[INFO] FP16 requested, but platform does not support fast FP16. Falling back to FP32.")
+    else:
+        print("[INFO] FP16 optimization disabled. Building FP32 TensorRT baseline.")
 
     profile = builder.create_optimization_profile()
     print("[INFO] Applying optimization profile:")
@@ -155,10 +157,12 @@ if __name__ == "__main__":
     parser.add_argument("--workspaceMB", type=int, default=1024, help="TensorRT workspace size in MB")
     parser.add_argument("--inputH", type=int, default=640, help="Fallback input image height for dynamic ONNX dims")
     parser.add_argument("--inputW", type=int, default=640, help="Fallback input image width for dynamic ONNX dims")
-    parser.add_argument("--fp16", dest="fp16", action="store_true", help="Enable FP16 (default)")
-    parser.add_argument("--no-fp16", dest="fp16", action="store_false", help="Disable FP16")
+    parser.add_argument("--fp16", dest="fp16", action="store_true",
+                        help="Enable FP16 optimization. Default is FP32.")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false",
+                        help="Disable FP16 optimization and build the FP32 baseline (default).")
     parser.add_argument("--verbose", action="store_true", help="Enable TensorRT verbose logs")
-    parser.set_defaults(fp16=True)
+    parser.set_defaults(fp16=False)
 
     args = parser.parse_args()
     main(

@@ -71,6 +71,69 @@ Optional score tuning:
 --tune_score
 ```
 
+## TensorRT Jetson FP32 Baseline
+
+TensorRT export builds FP32 engines by default. Use this as the baseline for
+All-Key, Key-Reuse, and KNDETR deployment.
+
+```bash
+python rtdetrv2_pytorch/tools/export_onnx.py \
+  -c rtdetrv2_pytorch/configs/kndrtr/temporal_kndetr_mot17.yml \
+  -r output/phase1_mot17_skip8/05_417_736.pth \
+  --key_onnx onnx/mot17_skip8/key_model.onnx \
+  --nonkey_onnx onnx/mot17_skip8/nonkey_model.onnx
+
+python rtdetrv2_pytorch/tools/export_trt.py \
+  -i onnx/mot17_skip8/key_model.onnx \
+  -o engines/mot17_skip8/key_fp32.engine \
+  -m key \
+  --workspaceMB 4096
+
+python rtdetrv2_pytorch/tools/export_trt.py \
+  -i onnx/mot17_skip8/nonkey_model.onnx \
+  -o engines/mot17_skip8/nonkey_fp32.engine \
+  -m nonkey \
+  --workspaceMB 4096
+```
+
+```bash
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --mode all_key \
+  -k 1 \
+  --power
+
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --mode reuse \
+  -k 1 \
+  -m 1 \
+  --power
+
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --nonkey_engine engines/mot17_skip8/nonkey_fp32.engine \
+  --mode knk \
+  -k 1 \
+  -m 1 \
+  --power
+```
+
+By default, `infer_trt.py` reports inference latency/FPS only. Add COCO mAP
+reporting to any inference command with:
+
+```bash
+--map \
+--ann_file ../dataset/mot17/val.json \
+--frames_root ../dataset/mot17/val
+```
+
 ## YOLO26 All-Key Baseline
 
 For a non-temporal YOLO26 baseline that runs the detector on every evaluated
