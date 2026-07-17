@@ -16,6 +16,7 @@ FP16 is opt-in. Add --fp16 only for explicit reduced-precision experiments.
 """
 
 import argparse
+from pathlib import Path
 
 try:
     import tensorrt as trt
@@ -130,6 +131,7 @@ def main(
     config.add_optimization_profile(profile)
 
     print("[INFO] Building TensorRT engine...")
+    Path(engine_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     if hasattr(builder, 'build_serialized_network'):
         serialized_engine = builder.build_serialized_network(network, config)
         if serialized_engine is None:

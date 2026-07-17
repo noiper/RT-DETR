@@ -78,6 +78,11 @@ class TensorRTInference:
         self._signature: Optional[Tuple[Tuple[str, Tuple[int, ...], torch.dtype, bool], ...]] = None
         self._buffers: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._binding_addrs: OrderedDict[str, int] = OrderedDict()
+        self._tensor_dtypes = {
+            name: self._torch_dtype(self.engine.get_tensor_dtype(name))
+            for name in self.tensor_names
+        }
+        self._warned_zero_copy_fallback = set()
 
     def _load_engine(self, path: str):
         with open(path, "rb") as f:
@@ -85,6 +90,11 @@ class TensorRTInference:
         if engine is None:
             raise RuntimeError(f"Failed to deserialize TensorRT engine: {path}")
         return engine
+
+    @staticmethod
+    def _torch_dtype(trt_dtype):
+        np_dtype = trt.nptype(trt_dtype)
+        return torch.from_numpy(np.empty([], dtype=np_dtype)).dtype
 
     def validate_bindings(self, required_inputs: set, required_outputs: set, tag: str):
         missing_inputs = sorted(required_inputs - set(self.input_names))
@@ -95,6 +105,23 @@ class TensorRTInference:
                 f"Missing inputs={missing_inputs}, missing outputs={missing_outputs}. "
                 f"Found inputs={self.input_names}, outputs={self.output_names}"
             )
+
+    def binding_dtypes(self) -> Dict[str, str]:
+        return {name: str(dtype).replace("torch.", "") for name, dtype in self._tensor_dtypes.items()}
+
+    def _can_zero_copy(self, name: str, tensor: torch.Tensor, zero_copy_inputs: set) -> bool:
+        if name not in zero_copy_inputs:
+            return False
+        expected_dtype = self._tensor_dtypes[name]
+        if tensor.dtype == expected_dtype:
+            return True
+        if name not in self._warned_zero_copy_fallback:
+            print(
+                f"[WARN] Zero-copy disabled for input '{name}' because source dtype "
+                f"{tensor.dtype} does not match engine dtype {expected_dtype}; copying instead."
+            )
+            self._warned_zero_copy_fallback.add(name)
+        return False
 
     def _ensure_buffers(self, blob: Dict[str, torch.Tensor], zero_copy_inputs: Optional[set] = None):
         zero_copy_inputs = zero_copy_inputs or set()
@@ -111,8 +138,11 @@ class TensorRTInference:
                 raise RuntimeError(
                     f"Input '{name}' is on {tensor.device}, expected {self.device}. "
                     "Move all tensors to the inference device before calling infer()."
-                )
-            signature.append((name, tuple(tensor.shape), tensor.dtype, name in zero_copy_inputs))
+            )
+            expected_dtype = self._tensor_dtypes[name]
+            signature.append(
+                (name, tuple(tensor.shape), expected_dtype, self._can_zero_copy(name, tensor, zero_copy_inputs))
+            )
 
         sig_tuple = tuple(signature)
         if sig_tuple == self._signature:
@@ -124,10 +154,14 @@ class TensorRTInference:
         for name in self.input_names:
             tensor = blob[name]
             self.context.set_input_shape(name, tuple(tensor.shape))
-            if name in zero_copy_inputs:
+            if self._can_zero_copy(name, tensor, zero_copy_inputs):
                 self._binding_addrs[name] = tensor.data_ptr()
             else:
-                self._buffers[name] = torch.empty_like(tensor, device=self.device)
+                self._buffers[name] = torch.empty(
+                    tuple(tensor.shape),
+                    dtype=self._tensor_dtypes[name],
+                    device=self.device,
+                )
                 self._binding_addrs[name] = self._buffers[name].data_ptr()
 
         for name in self.output_names:
@@ -149,11 +183,11 @@ class TensorRTInference:
         self._ensure_buffers(blob, zero_copy_inputs)
 
         for name in zero_copy_inputs:
-            if name in self.input_names:
+            if name in self.input_names and self._can_zero_copy(name, blob[name], zero_copy_inputs):
                 self._binding_addrs[name] = blob[name].data_ptr()
 
         for name in self.input_names:
-            if name in zero_copy_inputs:
+            if self._can_zero_copy(name, blob[name], zero_copy_inputs):
                 continue
             self._buffers[name].copy_(blob[name])
 
@@ -757,6 +791,10 @@ def main():
 
     summary = {
         "mode": args.mode,
+        "key_engine": args.key_engine,
+        "nonkey_engine": args.nonkey_engine if args.mode == "knk" else None,
+        "key_engine_binding_dtypes": key_engine.binding_dtypes(),
+        "nonkey_engine_binding_dtypes": nonkey_engine.binding_dtypes() if nonkey_engine is not None else None,
         "raw_frames_total": len(frame_paths),
         "raw_frames_skipped": skipped_frames,
         "evaluated_frames_total": executed_idx,

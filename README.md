@@ -134,6 +134,72 @@ reporting to any inference command with:
 --frames_root ../dataset/mot17/val
 ```
 
+## TensorRT FP16-All Experiment
+
+FP16-all uses FP16 TensorRT optimization for both the key and non-key engines.
+Keep the FP32 engines/results as the accuracy baseline, then validate FP16 mAP
+before reporting speedups.
+
+```bash
+python rtdetrv2_pytorch/tools/export_trt.py \
+  -i onnx/mot17_skip8/key_model.onnx \
+  -o engines/mot17_skip8/key_fp16.engine \
+  -m key \
+  --fp16 \
+  --workspaceMB 4096
+
+python rtdetrv2_pytorch/tools/export_trt.py \
+  -i onnx/mot17_skip8/nonkey_model.onnx \
+  -o engines/mot17_skip8/nonkey_fp16.engine \
+  -m nonkey \
+  --fp16 \
+  --workspaceMB 4096
+```
+
+First check All-Key FP16 mAP. If this is much lower than FP32 All-Key, debug the
+key engine before interpreting temporal results.
+
+```bash
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp16.engine \
+  --mode all_key \
+  -k 1 \
+  --warmup 10 \
+  --map \
+  --ann_file ../dataset/mot17/val.json \
+  --frames_root ../dataset/mot17/val \
+  --save_json output/trt_fp16_all/all_key.json
+
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp16.engine \
+  --mode reuse \
+  -k 1 \
+  -m 1 \
+  --warmup 10 \
+  --map \
+  --ann_file ../dataset/mot17/val.json \
+  --frames_root ../dataset/mot17/val \
+  --save_json output/trt_fp16_all/reuse_m1.json
+
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp16.engine \
+  --nonkey_engine engines/mot17_skip8/nonkey_fp16.engine \
+  --mode knk \
+  -k 1 \
+  -m 1 \
+  --warmup 10 \
+  --map \
+  --ann_file ../dataset/mot17/val.json \
+  --frames_root ../dataset/mot17/val \
+  --save_json output/trt_fp16_all/knk_m1.json
+```
+
 ## YOLO26 All-Key Baseline
 
 For a non-temporal YOLO26 baseline that runs the detector on every evaluated
