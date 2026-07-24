@@ -134,6 +134,20 @@ reporting to any inference command with:
 --frames_root ../dataset/mot17/val
 ```
 
+With `--map`, the script defaults to `--map_frame_source ann`, so the evaluated
+frame list comes from the COCO annotation file instead of recursively scanning
+every image under `--frames_dir`. This keeps mAP and latency on the same
+annotated split and avoids unmapped frames when the image folder contains extra
+sequences. Use `--map_frame_source frames_dir` only when you intentionally want
+the older directory-scan behavior.
+
+For MOT17 inference-only runs without `--map`, exclude the non-30-FPS validation
+sequence explicitly:
+
+```bash
+--exclude_sequences MOT17-05-FRCNN
+```
+
 ## TensorRT FP16-All Experiment
 
 FP16-all uses FP16 TensorRT optimization for both the key and non-key engines.
@@ -198,6 +212,67 @@ python rtdetrv2_pytorch/tools/infer_trt.py \
   --ann_file ../dataset/mot17/val.json \
   --frames_root ../dataset/mot17/val \
   --save_json output/trt_fp16_all/knk_m1.json
+```
+
+## TensorRT INT8 Non-Key Experiment
+
+INT8 is implemented for the non-key engine only. Reuse the existing key FP32 or
+key FP16 engine, collect real non-key calibration inputs from that key engine,
+then build a calibrated non-key INT8 engine.
+
+```bash
+python rtdetrv2_pytorch/tools/collect_nonkey_calibration.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --output_dir output/calib_nonkey_int8_from_key_fp32 \
+  --max_samples 512 \
+  --compressed
+
+python rtdetrv2_pytorch/tools/export_trt.py \
+  -i onnx/mot17_skip8/nonkey_model.onnx \
+  -o engines/mot17_skip8/nonkey_int8.engine \
+  -m nonkey \
+  --int8 \
+  --calib_data output/calib_nonkey_int8_from_key_fp32 \
+  --calib_cache engines/mot17_skip8/nonkey_int8.cache \
+  --workspaceMB 4096
+```
+
+Run FP32-key + INT8-nonkey:
+
+```bash
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --nonkey_engine engines/mot17_skip8/nonkey_int8.engine \
+  --mode knk \
+  -k 1 \
+  -m 1 \
+  --warmup 10 \
+  --map \
+  --ann_file ../dataset/mot17/val.json \
+  --frames_root ../dataset/mot17/val \
+  --save_json output/trt_int8_nk/key_fp32_nonkey_int8.json
+```
+
+Run FP16-key + the same INT8-nonkey engine by changing only the key engine:
+
+```bash
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp16.engine \
+  --nonkey_engine engines/mot17_skip8/nonkey_int8.engine \
+  --mode knk \
+  -k 1 \
+  -m 1 \
+  --warmup 10 \
+  --map \
+  --ann_file ../dataset/mot17/val.json \
+  --frames_root ../dataset/mot17/val \
+  --save_json output/trt_int8_nk/key_fp16_nonkey_int8.json
 ```
 
 ## YOLO26 All-Key Baseline

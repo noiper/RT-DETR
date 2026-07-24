@@ -20,6 +20,7 @@ Example KNDETR run:
 
 Optional mAP:
     add --map --ann_file ../dataset/mot17/val.json --frames_root ../dataset/mot17/val
+    By default, --map evaluates the frame list from the COCO annotation file.
 """
 
 import argparse
@@ -440,6 +441,50 @@ def _load_coco_mapping(ann_file: str, frames_root: Optional[Path]):
     return coco_gt, by_rel, by_name, frames_root
 
 
+def _list_coco_frames(coco_gt, frames_root: Path, num_frames: int) -> List[Path]:
+    frame_paths: List[Path] = []
+    missing_files: List[str] = []
+
+    for image in coco_gt.dataset.get("images", []):
+        rel_path = Path(str(image["file_name"]))
+        frame_path = rel_path if rel_path.is_absolute() else frames_root / rel_path
+        if not frame_path.exists():
+            missing_files.append(str(frame_path))
+            continue
+        frame_paths.append(frame_path.resolve())
+
+    if missing_files:
+        sample = "\n  ".join(missing_files[:10])
+        raise SystemExit(
+            f"{len(missing_files)} COCO image files were not found under frames_root={frames_root}.\n"
+            f"First missing files:\n  {sample}"
+        )
+
+    if num_frames and num_frames > 0:
+        frame_paths = frame_paths[:num_frames]
+    return frame_paths
+
+
+def _exclude_sequences(
+    frame_paths: List[Path],
+    frames_root: Path,
+    exclude_sequences: List[str],
+) -> Tuple[List[Path], Dict[str, int]]:
+    excluded = {name.strip() for name in exclude_sequences if name.strip()}
+    if not excluded:
+        return frame_paths, {}
+
+    kept: List[Path] = []
+    counts: Dict[str, int] = {}
+    for frame_path in frame_paths:
+        video_id = _extract_video_id(frame_path, frames_root)
+        if video_id in excluded:
+            counts[video_id] = counts.get(video_id, 0) + 1
+            continue
+        kept.append(frame_path)
+    return kept, counts
+
+
 def _image_id_for_path(
     frame_path: Path,
     frames_root: Optional[Path],
@@ -541,6 +586,24 @@ def parse_args():
         help="Report COCO mAP for predicted frames. By default, only inference metrics are reported.",
     )
     parser.add_argument("--ann_file", type=str, default=None, help="COCO annotation file required for --eval_map")
+    parser.add_argument(
+        "--map_frame_source",
+        choices=("ann", "frames_dir"),
+        default="ann",
+        help=(
+            "Frame source used with --eval_map. 'ann' evaluates exactly the COCO annotation image list; "
+            "'frames_dir' preserves the old recursive directory scan and warns for unmapped frames."
+        ),
+    )
+    parser.add_argument(
+        "--exclude_sequences",
+        nargs="+",
+        default=[],
+        help=(
+            "Video/sequence ids to exclude from the frame list, e.g. MOT17-05-FRCNN. "
+            "The id is the first path component relative to --frames_root."
+        ),
+    )
     parser.add_argument("--print_every", type=int, default=50, help="Progress print interval in frames")
     parser.add_argument("--save_csv", type=str, default=None, help="Optional per-frame metrics CSV path")
     parser.add_argument("--save_json", type=str, default=None, help="Optional summary JSON path")
@@ -561,15 +624,7 @@ def main():
     frames_dir = Path(args.frames_dir).expanduser().resolve()
     if not frames_dir.exists():
         raise SystemExit(f"frames_dir does not exist: {frames_dir}")
-    frame_paths = _list_frames(frames_dir, args.num_frames, args.recursive)
     frames_root = Path(args.frames_root).expanduser().resolve() if args.frames_root else frames_dir
-
-    print(
-        f"[INFO] Mode={args.mode}, raw_frames={len(frame_paths)}, warmup={args.warmup}, "
-        f"k={args.fps_divisor}, m={args.nk_per_key}, nonkey_score={args.nonkey_score:.3f}"
-    )
-    print(f"[INFO] Frames dir: {frames_dir}")
-    print(f"[INFO] Recursive: {args.recursive}")
 
     key_engine = TensorRTInference(args.key_engine, device=args.device, verbose=args.verbose_trt)
     key_engine.validate_bindings(
@@ -597,6 +652,30 @@ def main():
         coco_gt, coco_by_rel, coco_by_name, frames_root = _load_coco_mapping(args.ann_file, frames_root)
         print(f"[INFO] COCO mAP enabled. Annotation file: {args.ann_file}")
         print(f"[INFO] COCO frame root: {frames_root}")
+
+    if args.eval_map and args.map_frame_source == "ann":
+        frame_paths = _list_coco_frames(coco_gt, frames_root, args.num_frames)
+    else:
+        frame_paths = _list_frames(frames_dir, args.num_frames, args.recursive)
+    frame_paths, excluded_sequence_counts = _exclude_sequences(
+        frame_paths,
+        frames_root,
+        args.exclude_sequences,
+    )
+
+    print(
+        f"[INFO] Mode={args.mode}, raw_frames={len(frame_paths)}, warmup={args.warmup}, "
+        f"k={args.fps_divisor}, m={args.nk_per_key}, nonkey_score={args.nonkey_score:.3f}"
+    )
+    print(f"[INFO] Frames dir: {frames_dir}")
+    print(f"[INFO] Recursive: {args.recursive}")
+    if args.eval_map:
+        print(f"[INFO] COCO frame source: {args.map_frame_source}")
+    if excluded_sequence_counts:
+        excluded_msg = ", ".join(
+            f"{name}={count}" for name, count in sorted(excluded_sequence_counts.items())
+        )
+        print(f"[INFO] Excluded sequences: {excluded_msg}")
 
     power_monitor = TegrastatsMonitor(args.tegrastats_interval_ms) if args.power else None
     if power_monitor is not None:
@@ -803,6 +882,8 @@ def main():
         "fps_divisor": args.fps_divisor,
         "nk_per_key": args.nk_per_key,
         "nonkey_score": args.nonkey_score,
+        "map_frame_source": args.map_frame_source if args.eval_map else None,
+        "excluded_sequences": excluded_sequence_counts,
         "cache_zero_copy": args.mode == "knk",
         "input_h": args.input_h,
         "input_w": args.input_w,
