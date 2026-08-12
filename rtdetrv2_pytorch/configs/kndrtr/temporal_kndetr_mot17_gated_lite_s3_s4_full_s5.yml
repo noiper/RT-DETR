@@ -1,0 +1,13 @@
+# Temporal KNDETR with gated lightweight S3/S4 and full S5 Non-Key fusion.
+#
+# Non-Key frames keep cached Key S3/S4 as the anchor, add a learnable gated
+# current-frame S3/S4 projection residual, and keep full fusion at S5.
+
+__include__: [
+  './temporal_kndetr_mot17.yml',
+]
+
+output_dir: './output/temporal_mot17_gated_lite_s3_s4_full_s5_level1'
+non_key_fusion_mode: gated_lite_s3_s4_full_s5
+lite_fusion_init_scale: 0.1
+lite_fusion_max_scale: 1.0

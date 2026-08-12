@@ -88,6 +88,12 @@ def _compare_prefixed_state_dicts(
         'max_abs_diff': max_abs_diff,
     }
 
+
+def _load_temporal_state_dict_compat(model: TemporalRTDETR, state_dict: Dict[str, torch.Tensor]) -> None:
+    missing = model.load_state_dict_with_fusion_compat(state_dict)
+    if missing:
+        print(f"   [Compatibility] Initialized new parameters not present in checkpoint: {missing}")
+
 class Trainer:
     """
     Training Strategies:
@@ -238,7 +244,9 @@ class Trainer:
 
                 # --- Feature KD Logic ---
                 if self.lambda_kd > 0:
-                    for s_feat, t_feat in zip(student_fused, teacher_ccff):
+                    for scale_idx in self.model.active_fusion_block_indices():
+                        s_feat = student_fused[scale_idx]
+                        t_feat = teacher_ccff[scale_idx]
                         loss_kd_feat += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
 
                 loss_dict_non_key, non_key_indices = self.criterion(
@@ -533,6 +541,9 @@ def build_model_from_config(config_path: str, device: torch.device):
     # Get temporal training parameters
     use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
     reuse_position = cfg.yaml_cfg.get('reuse_position', 0)
+    non_key_fusion_mode = cfg.yaml_cfg.get('non_key_fusion_mode', 'all')
+    lite_fusion_init_scale = cfg.yaml_cfg.get('lite_fusion_init_scale', 0.1)
+    lite_fusion_max_scale = cfg.yaml_cfg.get('lite_fusion_max_scale', 1.0)
     
     # Create temporal model
     temporal_model = TemporalRTDETR(
@@ -544,6 +555,9 @@ def build_model_from_config(config_path: str, device: torch.device):
         num_queries=num_queries,
         use_lightweight_decoder=use_lightweight_decoder,
         reuse_position=reuse_position,
+        non_key_fusion_mode=non_key_fusion_mode,
+        lite_fusion_init_scale=lite_fusion_init_scale,
+        lite_fusion_max_scale=lite_fusion_max_scale,
     )
     
     return temporal_model, cfg
@@ -611,12 +625,12 @@ def main():
             print(f"   Source key-path fingerprint: {source_fp['sha256'][:16]} ({source_fp['matched_keys']} tensors)")
             
             if is_temporal:
-                print("   [Auto-Detect] Full Temporal weights found. Loading strictly...")
+                print("   [Auto-Detect] Full Temporal weights found. Loading with fusion compatibility checks...")
                 has_non_key_prediction_heads = any(k.startswith(NON_KEY_HEAD_PREFIXES) for k in state_dict.keys())
                 if has_non_key_prediction_heads and hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
                     model.decouple_non_key_prediction_heads()
                     print("   [Safety] Decoupled non-key prediction heads before strict temporal load.")
-                model.load_state_dict(state_dict, strict=True)
+                _load_temporal_state_dict_compat(model, state_dict)
                 load_report = _compare_prefixed_state_dicts(
                     state_dict, model.state_dict(), KEY_PATH_PREFIXES
                 )
@@ -724,8 +738,9 @@ def main():
                 or 'lightweight_decoder.dec_bbox_head' in name
                 or 'lightweight_decoder.query_pos_head' in name
             )
+            train_active_fusion_block = model.is_trainable_fusion_parameter(name)
             if (
-                'fusion_blocks' in name
+                train_active_fusion_block
                 or 'lightweight_decoder.decoder' in name
                 or train_prediction_modules
             ):
@@ -736,9 +751,10 @@ def main():
                 
         elif args.training_strategy == 'joint':
             # Train heavy decoder, fusion blocks, and light decoder.
+            train_active_fusion_block = model.is_trainable_fusion_parameter(name)
             if (
                 'decoder.' in name
-                or 'fusion_blocks' in name
+                or train_active_fusion_block
                 or 'lightweight_decoder.decoder' in name
             ):
                 param.requires_grad = True

@@ -275,6 +275,58 @@ python rtdetrv2_pytorch/tools/infer_trt.py \
   --save_json output/trt_int8_nk/key_fp16_nonkey_int8.json
 ```
 
+## TensorRT INT4 Non-Key Experiment
+
+INT4 is implemented for the non-key engine only while keeping the key engine
+FP32. Unlike the INT8 path, INT4 must use explicit Q/DQ weight-only quantization.
+TensorRT's native `BuilderFlag.INT4` alone is diagnostic-only for this graph
+because it can build an FP32-like engine with FP32-like size and latency.
+
+Collect real non-key calibration inputs from the FP32 key engine, then build the
+INT4 Q/DQ non-key engine:
+
+```bash
+python rtdetrv2_pytorch/tools/collect_nonkey_calibration.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --output_dir output/calib_nonkey_int4_from_key_fp32 \
+  --max_samples 512 \
+  --compressed
+
+python rtdetrv2_pytorch/tools/export_trt.py \
+  -i onnx/mot17_skip8/nonkey_model.onnx \
+  -o engines/mot17_skip8/nonkey_int4.engine \
+  -m nonkey \
+  --int4 \
+  --int4_mode qdq \
+  --calib_data output/calib_nonkey_int4_from_key_fp32 \
+  --int4_onnx onnx/mot17_skip8/nonkey_int4_qdq.onnx \
+  --workspaceMB 4096
+```
+
+If the TensorRT build machine does not have ModelOpt installed, generate
+`nonkey_int4_qdq.onnx` on another machine, copy it to the Jetson, then build with
+`--int4 --int4_mode qdq --int4_prequantized`.
+
+Run FP32-key + INT4-nonkey:
+
+```bash
+python rtdetrv2_pytorch/tools/infer_trt.py \
+  --frames_dir ../dataset/mot17/val \
+  --recursive \
+  --key_engine engines/mot17_skip8/key_fp32.engine \
+  --nonkey_engine engines/mot17_skip8/nonkey_int4.engine \
+  --mode knk \
+  -k 1 \
+  -m 1 \
+  --warmup 10 \
+  --map \
+  --ann_file ../dataset/mot17/val.json \
+  --frames_root ../dataset/mot17/val \
+  --save_json output/trt_int4_nk/key_fp32_nonkey_int4.json
+```
+
 ## YOLO26 All-Key Baseline
 
 For a non-temporal YOLO26 baseline that runs the detector on every evaluated

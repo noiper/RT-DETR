@@ -81,6 +81,9 @@ def build_temporal_model(cfg, device):
         num_queries=num_queries,
         use_lightweight_decoder=cfg.yaml_cfg.get('use_lightweight_decoder', False),
         reuse_position=cfg.yaml_cfg.get('reuse_position', 0),
+        non_key_fusion_mode=cfg.yaml_cfg.get('non_key_fusion_mode', 'all'),
+        lite_fusion_init_scale=cfg.yaml_cfg.get('lite_fusion_init_scale', 0.1),
+        lite_fusion_max_scale=cfg.yaml_cfg.get('lite_fusion_max_scale', 1.0),
     ).to(device)
 
 
@@ -94,7 +97,9 @@ def load_weights(model, weights_path, device):
         print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
         model.decouple_non_key_prediction_heads()
 
-    model.load_state_dict(state_dict, strict=True)
+    missing = model.load_state_dict_with_fusion_compat(state_dict)
+    if missing:
+        print(f"   [Compatibility] Initialized new parameters not present in checkpoint: {missing}")
     model.eval()
 
 

@@ -72,6 +72,9 @@ def _build_temporal_model(cfg):
         num_queries=num_queries,
         use_lightweight_decoder=cfg.yaml_cfg.get('use_lightweight_decoder', False),
         reuse_position=cfg.yaml_cfg.get('reuse_position', 0),
+        non_key_fusion_mode=cfg.yaml_cfg.get('non_key_fusion_mode', 'all'),
+        lite_fusion_init_scale=cfg.yaml_cfg.get('lite_fusion_init_scale', 0.1),
+        lite_fusion_max_scale=cfg.yaml_cfg.get('lite_fusion_max_scale', 1.0),
     )
     return temporal_model
 
@@ -103,7 +106,9 @@ def main(args):
             print("   [Warning] Model does not support decoupling, skipping...")
 
     try:
-        model.load_state_dict(state, strict=True)
+        missing = model.load_state_dict_with_fusion_compat(state)
+        if missing:
+            print(f"   [Compatibility] Initialized new parameters not present in checkpoint: {missing}")
     except RuntimeError as e:
         raise RuntimeError(
             f"Failed to load checkpoint into TemporalRTDETR. "

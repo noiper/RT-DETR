@@ -33,6 +33,9 @@ def build_model(cfg: YAMLConfig, weights: str, device: torch.device) -> Temporal
         num_queries=num_queries,
         use_lightweight_decoder=cfg.yaml_cfg.get("use_lightweight_decoder", True),
         reuse_position=cfg.yaml_cfg.get("reuse_position", 0),
+        non_key_fusion_mode=cfg.yaml_cfg.get("non_key_fusion_mode", "all"),
+        lite_fusion_init_scale=cfg.yaml_cfg.get("lite_fusion_init_scale", 0.1),
+        lite_fusion_max_scale=cfg.yaml_cfg.get("lite_fusion_max_scale", 1.0),
     ).to(device)
 
     checkpoint = torch.load(weights, map_location=device, weights_only=False)
@@ -40,7 +43,9 @@ def build_model(cfg: YAMLConfig, weights: str, device: torch.device) -> Temporal
     if any("lightweight_decoder.dec_score_head" in k for k in state_dict.keys()):
         print("Auto-detected decoupled non-key prediction heads.")
         model.decouple_non_key_prediction_heads()
-    model.load_state_dict(state_dict, strict=True)
+    missing = model.load_state_dict_with_fusion_compat(state_dict)
+    if missing:
+        print(f"Initialized new parameters not present in checkpoint: {missing}")
     model.eval()
     return model
 

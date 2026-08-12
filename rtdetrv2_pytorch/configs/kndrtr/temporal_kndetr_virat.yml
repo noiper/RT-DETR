@@ -36,6 +36,9 @@ lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: use the fixed 1-layer non-key decoder
 reuse_position: 3             # Reuse query state from key decoder position (0=before decoder, 1..L=after layer)
+non_key_fusion_mode: all      # all, s5_only, s4_s5, lite_s3_s4_full_s5, or gated_lite_s3_s4_full_s5
+lite_fusion_init_scale: 0.1   # Initial gate scale for gated lightweight S3/S4 residuals
+lite_fusion_max_scale: 1.0    # Maximum gate scale for gated lightweight S3/S4 residuals
 
 # Training Settings
 epoches: 5

@@ -4,6 +4,14 @@ import copy
 from typing import Dict, List, Tuple, Optional
 from ..rtdetr.rtdetrv2_decoder import RTDETRTransformerv2, TransformerDecoder
 
+NON_KEY_FUSION_MODES = (
+    "all",
+    "s5_only",
+    "s4_s5",
+    "lite_s3_s4_full_s5",
+    "gated_lite_s3_s4_full_s5",
+)
+
 class TemporalFusionBlock(nn.Module):
     """
     Fusion block for combining non-key frame features (S) with cached key frame features (CCFF)
@@ -198,6 +206,9 @@ class TemporalRTDETR(nn.Module):
         num_queries: int = 300,
         use_lightweight_decoder: bool = True,
         reuse_position: int = 0,
+        non_key_fusion_mode: str = "all",
+        lite_fusion_init_scale: float = 0.1,
+        lite_fusion_max_scale: float = 1.0,
     ):
         super().__init__()
         
@@ -209,6 +220,20 @@ class TemporalRTDETR(nn.Module):
         self.num_queries = num_queries
         self.use_lightweight_decoder = use_lightweight_decoder
         self.reuse_position = int(reuse_position)
+        self.non_key_fusion_mode = str(non_key_fusion_mode)
+        if self.non_key_fusion_mode not in NON_KEY_FUSION_MODES:
+            raise ValueError(
+                f"non_key_fusion_mode must be one of {NON_KEY_FUSION_MODES}, "
+                f"but got {self.non_key_fusion_mode!r}"
+            )
+        self.lite_fusion_max_scale = float(lite_fusion_max_scale)
+        if self.lite_fusion_max_scale <= 0:
+            raise ValueError(f"lite_fusion_max_scale must be > 0, but got {self.lite_fusion_max_scale}")
+        if lite_fusion_init_scale < 0 or lite_fusion_init_scale > self.lite_fusion_max_scale:
+            raise ValueError(
+                f"lite_fusion_init_scale must be in [0, {self.lite_fusion_max_scale}], "
+                f"but got {lite_fusion_init_scale}"
+            )
         self.decoder_num_layers = getattr(getattr(decoder, 'decoder', None), 'num_layers', None)
         if self.reuse_position < 0:
             raise ValueError(f"reuse_position must be >= 0, but got {self.reuse_position}")
@@ -230,6 +255,14 @@ class TemporalRTDETR(nn.Module):
             TemporalFusionBlock(s_channels=256, hidden_dim=hidden_dim).to(device),  # S4 + CCFF2
             TemporalFusionBlock(s_channels=512, hidden_dim=hidden_dim).to(device),  # S5 + CCFF3
         ])
+        if self.non_key_fusion_mode == "gated_lite_s3_s4_full_s5":
+            eps = 1e-6
+            init_ratio = float(lite_fusion_init_scale) / self.lite_fusion_max_scale
+            init_ratio = min(max(init_ratio, eps), 1.0 - eps)
+            init_logit = torch.logit(torch.tensor(init_ratio, dtype=torch.float32, device=device))
+            self.lite_fusion_gate_logits = nn.Parameter(init_logit.repeat(2))
+        else:
+            self.register_parameter("lite_fusion_gate_logits", None)
 
         # Create lightweight decoder if needed
         if use_lightweight_decoder:
@@ -243,6 +276,89 @@ class TemporalRTDETR(nn.Module):
         print(f"  Success!")
         print(f"  - Use lightweight decoder: {use_lightweight_decoder}")
         print(f"  - Reuse position: {self.reuse_position}")
+        print(f"  - Non-key fusion mode: {self.non_key_fusion_mode}")
+
+    def active_fusion_block_indices(self) -> Tuple[int, ...]:
+        if self.non_key_fusion_mode == "s5_only":
+            return (2,)
+        if self.non_key_fusion_mode == "s4_s5":
+            return (1, 2)
+        return (0, 1, 2)
+
+    def is_trainable_fusion_parameter(self, name: str) -> bool:
+        if self.non_key_fusion_mode == "gated_lite_s3_s4_full_s5" and name == "lite_fusion_gate_logits":
+            return True
+        if "fusion_blocks." not in name:
+            return False
+        if self.non_key_fusion_mode == "s5_only":
+            return "fusion_blocks.2." in name
+        if self.non_key_fusion_mode == "s4_s5":
+            return "fusion_blocks.1." in name or "fusion_blocks.2." in name
+        if self.non_key_fusion_mode in ("lite_s3_s4_full_s5", "gated_lite_s3_s4_full_s5"):
+            return (
+                "fusion_blocks.0.s_proj." in name
+                or "fusion_blocks.1.s_proj." in name
+                or "fusion_blocks.2." in name
+            )
+        return True
+
+    def gate_compatible_missing_keys(self) -> Tuple[str, ...]:
+        if self.non_key_fusion_mode == "gated_lite_s3_s4_full_s5":
+            return ("lite_fusion_gate_logits",)
+        return ()
+
+    def load_state_dict_with_fusion_compat(self, state_dict: Dict[str, torch.Tensor]) -> List[str]:
+        load_result = self.load_state_dict(state_dict, strict=False)
+        allowed_missing = set(self.gate_compatible_missing_keys())
+        missing = list(load_result.missing_keys)
+        unexpected = list(load_result.unexpected_keys)
+        disallowed_missing = [key for key in missing if key not in allowed_missing]
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                "Temporal checkpoint is incompatible with this model. "
+                f"missing={disallowed_missing}, unexpected={unexpected}"
+            )
+        return missing
+
+    def lite_fusion_scales(self) -> Optional[torch.Tensor]:
+        if self.lite_fusion_gate_logits is None:
+            return None
+        return torch.sigmoid(self.lite_fusion_gate_logits) * self.lite_fusion_max_scale
+
+    def _fuse_non_key_features(self, s_features: List[torch.Tensor]) -> List[torch.Tensor]:
+        # s3/s4/s5 are current non-key backbone features:
+        # s3: [B, 128, H/8, W/8], s4: [B, 256, H/16, W/16], s5: [B, 512, H/32, W/32].
+        # cached_ccff are key encoder features at matching resolutions:
+        # [B, hidden_dim, H/8, W/8], [B, hidden_dim, H/16, W/16], [B, hidden_dim, H/32, W/32].
+        s3, s4, s5 = s_features
+
+        if self.non_key_fusion_mode == "s5_only":
+            # Fused outputs keep the decoder's expected three scales.
+            fused_s5 = self.fusion_blocks[2](s5, self.cached_ccff[2])  # [B, hidden_dim, H/32, W/32]
+            return [self.cached_ccff[0], self.cached_ccff[1], fused_s5]
+
+        if self.non_key_fusion_mode == "s4_s5":
+            fused_s4 = self.fusion_blocks[1](s4, self.cached_ccff[1])  # [B, hidden_dim, H/16, W/16]
+            fused_s5 = self.fusion_blocks[2](s5, self.cached_ccff[2])  # [B, hidden_dim, H/32, W/32]
+            return [self.cached_ccff[0], fused_s4, fused_s5]
+
+        if self.non_key_fusion_mode == "lite_s3_s4_full_s5":
+            lite_s3 = self.cached_ccff[0] + self.fusion_blocks[0].s_proj(s3)  # [B, hidden_dim, H/8, W/8]
+            lite_s4 = self.cached_ccff[1] + self.fusion_blocks[1].s_proj(s4)  # [B, hidden_dim, H/16, W/16]
+            fused_s5 = self.fusion_blocks[2](s5, self.cached_ccff[2])  # [B, hidden_dim, H/32, W/32]
+            return [lite_s3, lite_s4, fused_s5]
+
+        if self.non_key_fusion_mode == "gated_lite_s3_s4_full_s5":
+            scales = self.lite_fusion_scales()
+            lite_s3 = self.cached_ccff[0] + scales[0] * self.fusion_blocks[0].s_proj(s3)  # [B, hidden_dim, H/8, W/8]
+            lite_s4 = self.cached_ccff[1] + scales[1] * self.fusion_blocks[1].s_proj(s4)  # [B, hidden_dim, H/16, W/16]
+            fused_s5 = self.fusion_blocks[2](s5, self.cached_ccff[2])  # [B, hidden_dim, H/32, W/32]
+            return [lite_s3, lite_s4, fused_s5]
+
+        return [
+            fusion_block(s_feat, ccff_feat)
+            for s_feat, ccff_feat, fusion_block in zip(s_features, self.cached_ccff, self.fusion_blocks)
+        ]
     
     def forward_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Tuple:
         """
@@ -313,11 +429,8 @@ class TemporalRTDETR(nn.Module):
         s3, s4, s5 = backbone_features[-3:]
         s_features = [s3, s4, s5]
         
-        # Fuse each scale with cached CCFF
-        fused_features = []
-        for _, (s_feat, ccff_feat, fusion_block) in enumerate(zip(s_features, self.cached_ccff, self.fusion_blocks)):
-            fused = fusion_block(s_feat, ccff_feat)
-            fused_features.append(fused)
+        # Fuse current-frame backbone features with cached Key encoder features.
+        fused_features = self._fuse_non_key_features(s_features)
         
         # Prepare decoder input (fused multi-scale features)
         decoder_input = fused_features
@@ -391,6 +504,9 @@ def build_temporal_rtdetr(cfg):
         num_queries=cfg.num_queries,
         use_lightweight_decoder=cfg.get('use_lightweight_decoder', True),
         reuse_position=cfg.get('reuse_position', 0),
+        non_key_fusion_mode=cfg.get('non_key_fusion_mode', 'all'),
+        lite_fusion_init_scale=cfg.get('lite_fusion_init_scale', 0.1),
+        lite_fusion_max_scale=cfg.get('lite_fusion_max_scale', 1.0),
     )
     
     return model
